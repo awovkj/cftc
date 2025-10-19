@@ -2126,17 +2126,9 @@ async function handleUploadRequest(request, config) {
       .bind(storageType, finalCategoryId, chatId).run();
     const ext = (file.name.split('.').pop() || '').toLowerCase();
     const mimeType = getContentType(ext);
-    const [mainType] = mimeType.split('/');
-    const typeMap = {
-      image: { method: 'sendPhoto', field: 'photo' },
-      video: { method: 'sendVideo', field: 'video' },
-      audio: { method: 'sendAudio', field: 'audio' }
-    };
-    let { method = 'sendDocument', field = 'document' } = typeMap[mainType] || {};
-    if (['application', 'text'].includes(mainType)) {
-      method = 'sendDocument';
-      field = 'document';
-    }
+    // 为了支持更大的文件（例如超过 Telegram sendPhoto 的限制），统一使用 sendDocument 上传
+    const method = 'sendDocument';
+    const field = 'document';
     let finalUrl, dbFileId, dbMessageId;
     const now = Date.now();
     if (storageType === 'r2') {
