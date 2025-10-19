@@ -673,27 +673,27 @@ export default {
       database = createInMemoryDatabase();
     }
     const config = {
-      domain: env.DOMAIN || request.headers.get("host") || '',
-      database: database,
-      username: env.USERNAME || '',
-      password: env.PASSWORD || '',
-      enableAuth: env.ENABLE_AUTH === 'true' || false,
-      tgBotToken: env.TG_BOT_TOKEN || '',
-      tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [], 
-      tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID || '',
-      cookie: Number(env.COOKIE) || 7,
-      maxSizeMB: Number(env.MAX_SIZE_MB) || 20,
-      bucket: env.BUCKET,
-      fileCache: new Map(),
-      fileCacheTTL: 3600000,
-      buttonCache: new Map(),
-      buttonCacheTTL: 600000,
-      menuCache: new Map(),
-      menuCacheTTL: 300000,
-      notificationCache: '',
-      notificationCacheTTL: 3600000,
-      lastNotificationFetch: 0
-    };
+       domain: env.DOMAIN || request.headers.get("host") || '',
+       database: database,
+       username: env.USERNAME || '',
+       password: env.PASSWORD || '',
+       enableAuth: env.ENABLE_AUTH === 'true' || false,
+       tgBotToken: env.TG_BOT_TOKEN || '',
+       tgChatId: env.TG_CHAT_ID ? env.TG_CHAT_ID.split(",") : [],
+       tgStorageChatId: env.TG_STORAGE_CHAT_ID || env.TG_CHAT_ID || '',
+       cookie: Number(env.COOKIE) || 7,
+       maxSizeMB: Number(env.MAX_SIZE_MB) || 0,
+       bucket: env.BUCKET,
+       fileCache: new Map(),
+       fileCacheTTL: 3600000,
+       buttonCache: new Map(),
+       buttonCacheTTL: 600000,
+       menuCache: new Map(),
+       menuCacheTTL: 300000,
+       notificationCache: '',
+       notificationCacheTTL: 3600000,
+       lastNotificationFetch: 0
+     };
     if (config.enableAuth && (!config.username || !config.password)) {
         console.error("启用了认证但未配置用户名或密码");
         return new Response('认证配置错误: 缺少USERNAME或PASSWORD环境变量', { status: 500 });
@@ -2138,22 +2138,42 @@ async function handleUploadRequest(request, config) {
       field = 'document';
     }
     let finalUrl, dbFileId, dbMessageId;
+    const now = Date.now();
     if (storageType === 'r2') {
-      const key = `${Date.now()}.${ext}`;
-      await config.bucket.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: mimeType } });
+      const key = `${now}.${ext}`;
+      await config.bucket.put(key, file.stream(), { httpMetadata: { contentType: mimeType } });
       finalUrl = `https://${config.domain}/${key}`;
       dbFileId = key;
       dbMessageId = -1;
     } else {
-      const tgFormData = new FormData();
-      tgFormData.append('chat_id', config.tgStorageChatId);
-      tgFormData.append(field, file, file.name);
-      const tgResponse = await fetch(
-        `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
-        { method: 'POST', body: tgFormData }
-      );
-      if (!tgResponse.ok) throw new Error('Telegram参数配置错误');
-      const tgData = await tgResponse.json();
+      let tgData = null;
+      let tgResponse;
+      {
+        const tgFormData = new FormData();
+        tgFormData.append('chat_id', config.tgStorageChatId);
+        tgFormData.append(field, file, file.name);
+        tgResponse = await fetch(
+          `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
+          { method: 'POST', body: tgFormData }
+        );
+        try { tgData = await tgResponse.json(); } catch (_) { tgData = null; }
+      }
+      if (!tgResponse.ok || !tgData || !tgData.ok) {
+        const fbForm = new FormData();
+        fbForm.append('chat_id', config.tgStorageChatId);
+        fbForm.append('document', file, file.name);
+        const fbRes = await fetch(
+          `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
+          { method: 'POST', body: fbForm }
+        );
+        let fbData = null;
+        try { fbData = await fbRes.json(); } catch (_) { fbData = null; }
+        if (!fbRes.ok || !fbData || !fbData.ok) {
+          const errMsg = (fbData && fbData.description) ? fbData.description : (tgData && tgData.description) ? tgData.description : `HTTP ${tgResponse.status}`;
+          throw new Error('Telegram上传失败: ' + errMsg);
+        }
+        tgData = fbData;
+      }
       const result = tgData.result;
       const messageId = result.message_id;
       const fileId = result.document?.file_id ||
@@ -2162,13 +2182,13 @@ async function handleUploadRequest(request, config) {
                      (result.photo && result.photo[result.photo.length - 1]?.file_id);
       if (!fileId) throw new Error('未获取到文件ID');
       if (!messageId) throw new Error('未获取到tg消息ID');
-      finalUrl = `https://${config.domain}/${Date.now()}.${ext}`;
+      finalUrl = `https://${config.domain}/${now}.${ext}`;
       dbFileId = fileId;
       dbMessageId = messageId;
     }
-    const time = Date.now();
+    const time = now;
     const timestamp = new Date(time + 8 * 60 * 60 * 1000).toISOString();
-    const url = `https://${config.domain}/${time}.${ext}`;
+    const url = finalUrl;
     await config.database.prepare(`
       INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -3554,7 +3574,7 @@ function generateUploadPage(categoryOptions, storageType) {
         previewArea.appendChild(preview);
         const xhr = new XMLHttpRequest();
         xhr.responseType = 'text';
-        xhr.timeout = 600000;
+        xhr.timeout = 0;
         const progressTrack = preview.querySelector('.progress-track');
         const progressText = preview.querySelector('.progress-text');
         xhr.upload.addEventListener('progress', (e) => {
