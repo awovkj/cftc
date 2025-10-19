@@ -2098,6 +2098,93 @@ async function handleUploadRequest(request, config) {
       headers: { 'Content-Type': 'text/html;charset=UTF-8' }
     });
   }
+  
+  if (request.method === 'PUT') {
+    try {
+      const urlObj = new URL(request.url);
+      const storageType = urlObj.searchParams.get('storage_type') || 'r2';
+      const incomingFileName = urlObj.searchParams.get('filename') || '';
+      const ext = (incomingFileName.split('.').pop() || 'bin').toLowerCase();
+      const mimeType = request.headers.get('Content-Type') || getContentType(ext);
+      const now = Date.now();
+      if (!config.bucket) {
+        return new Response(JSON.stringify({ status: 0, msg: '未配置R2存储' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+      const key = `${now}.${ext}`;
+      await config.bucket.put(key, request.body, { httpMetadata: { contentType: mimeType } });
+      const r2Url = `https://${config.domain}/${key}`;
+      const sizeParam = urlObj.searchParams.get('size');
+      const fileSize = sizeParam ? parseInt(sizeParam, 10) : 0;
+      const categoryId = urlObj.searchParams.get('category');
+      const chatId = config.tgChatId[0];
+      let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+      if (!defaultCategory) {
+        try {
+          const result = await config.database.prepare('INSERT INTO categories (name, created_at) VALUES (?, ?)')
+            .bind('默认分类', Date.now()).run();
+          const newDefaultId = result.meta && result.meta.last_row_id;
+          if (newDefaultId) {
+            defaultCategory = { id: newDefaultId };
+          }
+        } catch (e) {
+          defaultCategory = { id: categoryId || null };
+        }
+      }
+      const finalCategoryId = categoryId || (defaultCategory ? defaultCategory.id : null);
+      await config.database.prepare('UPDATE user_settings SET storage_type = ?, current_category_id = ? WHERE chat_id = ?')
+        .bind(storageType, finalCategoryId, chatId).run();
+      let finalUrl = r2Url;
+      let dbFileId = key;
+      let dbMessageId = -1;
+      let storageTypeForRecord = storageType;
+      if (storageType === 'telegram') {
+        if (!config.tgBotToken || !config.tgStorageChatId) {
+          return new Response(JSON.stringify({ status: 0, msg: '未配置Telegram存储参数' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
+        const tgRes = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendDocument`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: config.tgStorageChatId, document: r2Url })
+        });
+        let tgData = null;
+        try { tgData = await tgRes.json(); } catch (_) { tgData = null; }
+        if (!tgRes.ok || !tgData || !tgData.ok) {
+          const errMsg = (tgData && tgData.description) ? tgData.description : `HTTP ${tgRes.status}`;
+          throw new Error('Telegram上传失败: ' + errMsg);
+        }
+        const result = tgData.result;
+        dbMessageId = result.message_id;
+        dbFileId = result.document?.file_id || result.video?.file_id || result.audio?.file_id || (result.photo && result.photo[result.photo.length - 1]?.file_id);
+        storageTypeForRecord = 'telegram';
+        const altKeyTime = now + 1;
+        const altKey = `${altKeyTime}.${ext}`;
+        finalUrl = `https://${config.domain}/${altKey}`;
+        // 注意：保留R2临时文件以确保Telegram能够成功拉取大文件
+      } else if (storageType !== 'r2') {
+        return new Response(JSON.stringify({ status: 0, msg: '不支持的存储类型' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      const timestamp = new Date(now + 8 * 60 * 60 * 1000).toISOString();
+      await config.database.prepare(`
+        INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        finalUrl,
+        dbFileId,
+        dbMessageId,
+        timestamp,
+        incomingFileName || key,
+        fileSize,
+        mimeType,
+        storageTypeForRecord,
+        finalCategoryId
+      ).run();
+      return new Response(JSON.stringify({ status: 1, msg: '✔ 上传成功', url: finalUrl }), { headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      console.error(`[Upload PUT Error] ${error.message}`);
+      return new Response(JSON.stringify({ status: 0, msg: '✘ 上传失败', error: error.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+  
   try {
     const formData = await request.formData();
     const file = formData.get('file');
@@ -3557,7 +3644,9 @@ function generateUploadPage(categoryOptions, storageType) {
         });
       }
       async function uploadFile(file) {
-        if (maxSizeMB && file.size > maxSizeMB * 1024 * 1024) {
+        const activeStorageBtn = document.querySelector('.storage-btn.active');
+        const storage = activeStorageBtn ? activeStorageBtn.dataset.storage : 'telegram';
+        if (maxSizeMB && file.size > maxSizeMB * 1024 * 1024 && storage !== 'telegram' && storage !== 'r2') {
           showConfirmModal('文件超过' + maxSizeMB + 'MB限制', null, true);
           return;
         }
@@ -3622,12 +3711,28 @@ function generateUploadPage(categoryOptions, storageType) {
           progressText.textContent = '✗ 上传失败：请求超时';
           preview.classList.add('error');
         });
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('category', categorySelect.value);
-        formData.append('storage_type', document.querySelector('.storage-btn.active').dataset.storage);
-        xhr.open('POST', '/upload');
-        xhr.send(formData);
+        const activeStorageBtn = document.querySelector('.storage-btn.active');
+        const storage = activeStorageBtn ? activeStorageBtn.dataset.storage : 'telegram';
+        if (storage === 'r2' || storage === 'telegram') {
+          const params = new URLSearchParams();
+          params.set('filename', file.name || 'upload.bin');
+          params.set('category', categorySelect.value || '');
+          params.set('storage_type', storage);
+          params.set('size', String(file.size || 0));
+          const url = '/upload?' + params.toString();
+          xhr.open('PUT', url);
+          if (file.type) xhr.setRequestHeader('Content-Type', file.type);
+          xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name || 'upload.bin'));
+          xhr.setRequestHeader('X-File-Size', String(file.size || 0));
+          xhr.send(file);
+        } else {
+          const formData = new FormData();
+          formData.append('file', file);
+          formData.append('category', categorySelect.value);
+          formData.append('storage_type', storage);
+          xhr.open('POST', '/upload');
+          xhr.send(formData);
+        }
       }
       function createPreview(file) {
         const div = document.createElement('div');
