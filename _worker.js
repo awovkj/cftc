@@ -2089,9 +2089,10 @@ async function handleUploadRequest(request, config) {
     let userSetting = await config.database.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(chatId).first();
     if (!userSetting) {
       const defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
+      const defaultStorage = config.bucket ? 'r2' : 'telegram';
       await config.database.prepare('INSERT INTO user_settings (chat_id, storage_type, current_category_id) VALUES (?, ?, ?)')
-        .bind(chatId, 'telegram', defaultCategory.id).run();
-      userSetting = { storage_type: 'telegram', current_category_id: defaultCategory.id };
+        .bind(chatId, defaultStorage, defaultCategory.id).run();
+      userSetting = { storage_type: defaultStorage, current_category_id: defaultCategory.id };
     }
     const html = generateUploadPage(categoryOptions, userSetting.storage_type);
     return new Response(html, {
@@ -3728,6 +3729,8 @@ function generateUploadPage(categoryOptions, storageType) {
           params.set('size', String(file.size || 0));
           const url = '/upload?' + params.toString();
           xhr.open('PUT', url);
+          xhr.withCredentials = true;
+          xhr.setRequestHeader('Accept', 'application/json');
           if (file.type) xhr.setRequestHeader('Content-Type', file.type);
           xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name || 'upload.bin'));
           xhr.setRequestHeader('X-File-Size', String(file.size || 0));
@@ -3738,6 +3741,8 @@ function generateUploadPage(categoryOptions, storageType) {
           formData.append('category', categorySelect.value);
           formData.append('storage_type', storage);
           xhr.open('POST', '/upload');
+          xhr.withCredentials = true;
+          xhr.setRequestHeader('Accept', 'application/json');
           xhr.send(formData);
         }
       }
