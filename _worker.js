@@ -2191,6 +2191,7 @@ async function handleUploadRequest(request, config) {
     const file = formData.get('file');
     const categoryId = formData.get('category');
     const storageType = formData.get('storage_type');
+    let usedStorage = storageType === 'r2' ? 'r2' : 'telegram';
     if (!file) throw new Error('未找到文件');
     const chatId = config.tgChatId[0] || 'web';
     let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
@@ -2211,7 +2212,7 @@ async function handleUploadRequest(request, config) {
     }
     const finalCategoryId = categoryId || (defaultCategory ? defaultCategory.id : null);
     await config.database.prepare('UPDATE user_settings SET storage_type = ?, current_category_id = ? WHERE chat_id = ?')
-      .bind(storageType, finalCategoryId, chatId).run();
+      .bind(usedStorage, finalCategoryId, chatId).run();
     const ext = (file.name.split('.').pop() || '').toLowerCase();
     const mimeType = getContentType(ext);
     // 为了支持更大的文件（例如超过 Telegram sendPhoto 的限制），统一使用 sendDocument 上传
@@ -2243,7 +2244,8 @@ async function handleUploadRequest(request, config) {
         finalUrl = `https://${config.domain}/${now}.${ext}`;
         dbFileId = fileId;
         dbMessageId = messageId;
-      } else {
+        usedStorage = 'telegram';
+        } else {
         await config.bucket.put(key, file.stream(), { httpMetadata: { contentType: mimeType } });
         finalUrl = `https://${config.domain}/${key}`;
         dbFileId = key;
@@ -2258,7 +2260,7 @@ async function handleUploadRequest(request, config) {
           finalUrl = `https://${config.domain}/${key}`;
           dbFileId = key;
           dbMessageId = -1;
-          storageType = 'r2';
+          usedStorage = 'r2';
         } else {
           throw new Error('Telegram参数配置错误');
         }
@@ -2307,6 +2309,8 @@ async function handleUploadRequest(request, config) {
     const time = now;
     const timestamp = new Date(time + 8 * 60 * 60 * 1000).toISOString();
     const url = finalUrl;
+    await config.database.prepare('UPDATE user_settings SET storage_type = ?, current_category_id = ? WHERE chat_id = ?')
+      .bind(usedStorage, finalCategoryId, chatId).run();
     await config.database.prepare(`
       INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2318,7 +2322,7 @@ async function handleUploadRequest(request, config) {
       file.name,
       file.size,
       file.type || getContentType(ext),
-      storageType,
+      usedStorage,
       finalCategoryId
     ).run();
     return new Response(
