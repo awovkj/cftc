@@ -3134,6 +3134,7 @@ function generateUploadPage(categoryOptions, storageType) {
         background: #fff;
         transition: all 0.3s ease;
         box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+        cursor: pointer;
       }
       .upload-area.dragover {
         border-color: #3498db;
@@ -3426,10 +3427,10 @@ function generateUploadPage(categoryOptions, storageType) {
           </div>
         </div>
       </div>
-      <div class="upload-area" id="uploadArea">
-        <p>点击选择 或 拖拽文件到此处</p>
-        <input type="file" id="fileInput" multiple style="display: none">
-      </div>
+      <label class="upload-area" id="uploadArea" for="fileInput">
+       <p>点击选择 或 拖拽文件到此处</p>
+       <input type="file" id="fileInput" multiple style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;">
+      </label>
       <div class="preview-area" id="previewArea"></div>
       <div class="url-area">
         <textarea id="urlArea" readonly placeholder="上传完成后的链接将显示在这里"></textarea>
@@ -3577,8 +3578,15 @@ function generateUploadPage(categoryOptions, storageType) {
       function unhighlight(e) {
         uploadArea.classList.remove('dragover');
       }
+      uploadArea.setAttribute('tabindex', '0');
       uploadArea.addEventListener('drop', handleDrop, false);
-      uploadArea.addEventListener('click', () => fileInput.click());
+      uploadArea.addEventListener('click', () => fileInput && fileInput.click());
+      uploadArea.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          if (fileInput) fileInput.click();
+        }
+      });
       fileInput.addEventListener('change', handleFiles);
       function handleDrop(e) {
         const dt = e.dataTransfer;
