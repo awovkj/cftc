@@ -2117,7 +2117,7 @@ async function handleUploadRequest(request, config) {
       const sizeParam = urlObj.searchParams.get('size');
       const fileSize = sizeParam ? parseInt(sizeParam, 10) : 0;
       const categoryId = urlObj.searchParams.get('category');
-      const chatId = config.tgChatId[0];
+      const chatId = config.tgChatId[0] || 'web';
       let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
       if (!defaultCategory) {
         try {
@@ -2192,7 +2192,7 @@ async function handleUploadRequest(request, config) {
     const categoryId = formData.get('category');
     const storageType = formData.get('storage_type');
     if (!file) throw new Error('未找到文件');
-    const chatId = config.tgChatId[0];
+    const chatId = config.tgChatId[0] || 'web';
     let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
     if (!defaultCategory) {
       try {
@@ -2221,50 +2221,88 @@ async function handleUploadRequest(request, config) {
     const now = Date.now();
     if (storageType === 'r2') {
       const key = `${now}.${ext}`;
-      await config.bucket.put(key, file.stream(), { httpMetadata: { contentType: mimeType } });
-      finalUrl = `https://${config.domain}/${key}`;
-      dbFileId = key;
-      dbMessageId = -1;
-    } else {
-      let tgData = null;
-      let tgResponse;
-      {
+      if (!config.bucket) {
+        // R2 未配置，尝试回退到 Telegram
+        if (!config.tgBotToken || !config.tgStorageChatId) {
+          throw new Error('未配置R2存储且Telegram参数配置错误');
+        }
         const tgFormData = new FormData();
         tgFormData.append('chat_id', config.tgStorageChatId);
         tgFormData.append(field, file, file.name);
-        tgResponse = await fetch(
-          `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
-          { method: 'POST', body: tgFormData }
-        );
-        try { tgData = await tgResponse.json(); } catch (_) { tgData = null; }
-      }
-      if (!tgResponse.ok || !tgData || !tgData.ok) {
-        const fbForm = new FormData();
-        fbForm.append('chat_id', config.tgStorageChatId);
-        fbForm.append('document', file, file.name);
-        const fbRes = await fetch(
-          `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
-          { method: 'POST', body: fbForm }
-        );
-        let fbData = null;
-        try { fbData = await fbRes.json(); } catch (_) { fbData = null; }
-        if (!fbRes.ok || !fbData || !fbData.ok) {
-          const errMsg = (fbData && fbData.description) ? fbData.description : (tgData && tgData.description) ? tgData.description : `HTTP ${tgResponse.status}`;
+        const tgResponse = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/${method}`, { method: 'POST', body: tgFormData });
+        const tgData = await tgResponse.json();
+        if (!tgResponse.ok || !tgData || !tgData.ok) {
+          const errMsg = (tgData && tgData.description) ? tgData.description : `HTTP ${tgResponse.status}`;
           throw new Error('Telegram上传失败: ' + errMsg);
         }
-        tgData = fbData;
+        const result = tgData.result;
+        const messageId = result.message_id;
+        const fileId = result.document?.file_id || result.video?.file_id || result.audio?.file_id || (result.photo && result.photo[result.photo.length - 1]?.file_id);
+        if (!fileId) throw new Error('未获取到文件ID');
+        if (!messageId) throw new Error('未获取到tg消息ID');
+        finalUrl = `https://${config.domain}/${now}.${ext}`;
+        dbFileId = fileId;
+        dbMessageId = messageId;
+      } else {
+        await config.bucket.put(key, file.stream(), { httpMetadata: { contentType: mimeType } });
+        finalUrl = `https://${config.domain}/${key}`;
+        dbFileId = key;
+        dbMessageId = -1;
       }
-      const result = tgData.result;
-      const messageId = result.message_id;
-      const fileId = result.document?.file_id ||
-                     result.video?.file_id ||
-                     result.audio?.file_id ||
-                     (result.photo && result.photo[result.photo.length - 1]?.file_id);
-      if (!fileId) throw new Error('未获取到文件ID');
-      if (!messageId) throw new Error('未获取到tg消息ID');
-      finalUrl = `https://${config.domain}/${now}.${ext}`;
-      dbFileId = fileId;
-      dbMessageId = messageId;
+    } else {
+      if (!config.tgBotToken || !config.tgStorageChatId) {
+        // Telegram 未配置，尝试回退到 R2
+        if (config.bucket) {
+          const key = `${now}.${ext}`;
+          await config.bucket.put(key, file.stream(), { httpMetadata: { contentType: mimeType } });
+          finalUrl = `https://${config.domain}/${key}`;
+          dbFileId = key;
+          dbMessageId = -1;
+          storageType = 'r2';
+        } else {
+          throw new Error('Telegram参数配置错误');
+        }
+      } else {
+        let tgData = null;
+        let tgResponse;
+        {
+          const tgFormData = new FormData();
+          tgFormData.append('chat_id', config.tgStorageChatId);
+          tgFormData.append(field, file, file.name);
+          tgResponse = await fetch(
+            `https://api.telegram.org/bot${config.tgBotToken}/${method}`,
+            { method: 'POST', body: tgFormData }
+          );
+          try { tgData = await tgResponse.json(); } catch (_) { tgData = null; }
+        }
+        if (!tgResponse.ok || !tgData || !tgData.ok) {
+          const fbForm = new FormData();
+          fbForm.append('chat_id', config.tgStorageChatId);
+          fbForm.append('document', file, file.name);
+          const fbRes = await fetch(
+            `https://api.telegram.org/bot${config.tgBotToken}/sendDocument`,
+            { method: 'POST', body: fbForm }
+          );
+          let fbData = null;
+          try { fbData = await fbRes.json(); } catch (_) { fbData = null; }
+          if (!fbRes.ok || !fbData || !fbData.ok) {
+            const errMsg = (fbData && fbData.description) ? fbData.description : (tgData && tgData.description) ? tgData.description : `HTTP ${tgResponse.status}`;
+            throw new Error('Telegram上传失败: ' + errMsg);
+          }
+          tgData = fbData;
+        }
+        const result = tgData.result;
+        const messageId = result.message_id;
+        const fileId = result.document?.file_id ||
+                       result.video?.file_id ||
+                       result.audio?.file_id ||
+                       (result.photo && result.photo[result.photo.length - 1]?.file_id);
+        if (!fileId) throw new Error('未获取到文件ID');
+        if (!messageId) throw new Error('未获取到tg消息ID');
+        finalUrl = `https://${config.domain}/${now}.${ext}`;
+        dbFileId = fileId;
+        dbMessageId = messageId;
+      }
     }
     const time = now;
     const timestamp = new Date(time + 8 * 60 * 60 * 1000).toISOString();
@@ -3429,7 +3467,7 @@ function generateUploadPage(categoryOptions, storageType) {
       </div>
       <div class="upload-area" id="uploadArea">
         <p>点击选择 或 拖拽文件到此处</p>
-        <input type="file" id="fileInput" multiple style="position:absolute;left:-9999px;width:1px;height:1px;opacity:0;">
+        <input type="file" id="fileInput" multiple style="display: none">
       </div>
       <div class="preview-area" id="previewArea"></div>
       <div class="url-area">
@@ -3578,15 +3616,8 @@ function generateUploadPage(categoryOptions, storageType) {
       function unhighlight(e) {
         uploadArea.classList.remove('dragover');
       }
-      uploadArea.setAttribute('tabindex', '0');
       uploadArea.addEventListener('drop', handleDrop, false);
-      uploadArea.addEventListener('click', () => fileInput && fileInput.click());
-      uploadArea.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          if (fileInput) fileInput.click();
-        }
-      });
+      uploadArea.addEventListener('click', () => fileInput.click());
       fileInput.addEventListener('change', handleFiles);
       function handleDrop(e) {
         const dt = e.dataTransfer;
@@ -3605,7 +3636,9 @@ function generateUploadPage(categoryOptions, storageType) {
       async function handleFiles(e) {
         
         
-        const files = Array.from(e.target.files);
+        const fileList = (e && e.target && e.target.files) ? e.target.files : (e && e.files ? e.files : []);
+        const files = Array.from(fileList || []);
+        if (!files.length) return;
         for (let file of files) {
           if (false && file.size > config.maxSizeMB * 1024 * 1024) {
             showConfirmModal(\`文件超过\${config.maxSizeMB}MB限制\`, null, true);
