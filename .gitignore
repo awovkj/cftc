@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# environment variables
+.env
+.env.*
+
+# build outputs
+/build/
+/dist/
+/.vercel/
+/.wrangler/
+/.cache/
+
+# system files
+.DS_Store
+Thumbs.db
