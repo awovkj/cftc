@@ -669,7 +669,7 @@ export default {
   async fetch(request, env) {
     let database = env.DATABASE;
     if (!database) {
-      console.warn("未检测到DATABASE环境变量，启用内存数据库（适用于Vercel等无D1环境）");
+      console.warn("未检测到DATABASE环境变量，启用内存数据库（适用于无D1环境）");
       database = createInMemoryDatabase();
     }
     const config = {
@@ -3389,6 +3389,11 @@ function generateUploadPage(categoryOptions, storageType) {
       const outputFormat = document.getElementById('outputFormat');
       const compressionControls = document.getElementById('compressionControls');
       qualityInput.addEventListener('input', () => { qualityVal.textContent = qualityInput.value; });
+      let maxSizeMB = null;
+      fetch('/config', { cache: 'no-store' })
+        .then(r => r.json())
+        .then(cfg => { if (cfg && typeof cfg.maxSizeMB === 'number') { maxSizeMB = cfg.maxSizeMB; } })
+        .catch(() => {});
       let uploadedUrls = [];
       let currentConfirmCallback = null;
       storageButtons.forEach(btn => {
@@ -3507,7 +3512,8 @@ function generateUploadPage(categoryOptions, storageType) {
         return t.startsWith('image/') && !t.includes('gif') && !t.includes('svg');
       }
       async function compressImage(file) {
-        const mime = (outputFormat && outputFormat.value && outputFormat.value !== 'auto') ? outputFormat.value : 'image/webp';
+        const defaultMime = (file && file.type) ? (file.type === 'image/jpg' ? 'image/jpeg' : file.type) : 'image/jpeg';
+        const mime = (outputFormat && outputFormat.value && outputFormat.value !== 'auto') ? outputFormat.value : defaultMime;
         const quality = parseFloat(qualityInput && qualityInput.value ? qualityInput.value : '0.8');
         return new Promise((resolve, reject) => {
           const reader = new FileReader();
@@ -3522,9 +3528,10 @@ function generateUploadPage(categoryOptions, storageType) {
                 ctx.drawImage(img, 0, 0);
                 canvas.toBlob((blob) => {
                   if (!blob) { resolve(file); return; }
-                  const ext = mime === 'image/jpeg' ? 'jpg' : 'webp';
+                  const extMap = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/avif': 'avif' };
                   const base = file.name.replace(/\.[^.]+$/, '');
-                  const newName = base + '.' + ext;
+                  const newExt = extMap[mime] || (file.name.split('.').pop() || 'jpg');
+                  const newName = base + '.' + newExt;
                   const compressedFile = new File([blob], newName, { type: mime });
                   resolve(compressedFile);
                 }, mime, quality);
@@ -3538,10 +3545,16 @@ function generateUploadPage(categoryOptions, storageType) {
         });
       }
       async function uploadFile(file) {
+        if (maxSizeMB && file.size > maxSizeMB * 1024 * 1024) {
+          showConfirmModal(`文件超过${maxSizeMB}MB限制`, null, true);
+          return;
+        }
         if (enableCompression && enableCompression.checked && isCompressibleImage(file)) { try { file = await compressImage(file); } catch (err) { console.error('压缩失败，使用原文件:', err); } }
         const preview = createPreview(file);
         previewArea.appendChild(preview);
         const xhr = new XMLHttpRequest();
+        xhr.responseType = 'text';
+        xhr.timeout = 600000;
         const progressTrack = preview.querySelector('.progress-track');
         const progressText = preview.querySelector('.progress-text');
         xhr.upload.addEventListener('progress', (e) => {
@@ -3552,26 +3565,50 @@ function generateUploadPage(categoryOptions, storageType) {
           }
         });
         xhr.addEventListener('load', () => {
-          try {
-            const data = JSON.parse(xhr.responseText);
-            const progressText = preview.querySelector('.progress-text');
-            if (xhr.status >= 200 && xhr.status < 300 && data.status === 1) {
-              progressText.textContent = data.msg;
-              uploadedUrls.push(data.url);
-              updateUrlArea();
-              preview.classList.add('success');
-              if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(data.url).catch(() => {});
-              }
-            } else {
-              const errorMsg = [data.msg, data.error || '未知错误'].filter(Boolean).join(' | ');
-              progressText.textContent = errorMsg;
-              preview.classList.add('error');
+          const ct = (xhr.getResponseHeader('Content-Type') || '').toLowerCase();
+          let data = null;
+          if (ct.includes('application/json')) {
+            try { data = JSON.parse(xhr.responseText); } catch (_) {}
+          }
+          if (xhr.status >= 200 && xhr.status < 300 && data && data.status === 1) {
+            progressText.textContent = data.msg;
+            uploadedUrls.push(data.url);
+            updateUrlArea();
+            preview.classList.add('success');
+            if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(data.url).catch(() => {});
             }
-          } catch (e) {
-            preview.querySelector('.progress-text').textContent = '✗ 响应解析失败';
+          } else {
+            let message = '✗ 上传失败';
+            if (data) {
+              message = [data.msg, data.error].filter(Boolean).join(' | ') || message;
+            } else {
+              if (xhr.status === 413) {
+                message = '✗ 上传失败：文件过大，超过服务器限制';
+              } else if (xhr.status === 0) {
+                message = '✗ 上传失败：网络错误';
+              } else if (xhr.status >= 500) {
+                message = '✗ 上传失败：服务器错误';
+              } else {
+                const text = (xhr.responseText || '').toString().trim();
+                if (text) {
+                  message = '✗ 上传失败：' + (text.length > 120 ? text.slice(0, 120) + '…' : text);
+                }
+              }
+            }
+            progressText.textContent = message;
             preview.classList.add('error');
           }
+        });
+        xhr.addEventListener('error', () => {
+          const progressText = preview.querySelector('.progress-text');
+          progressText.textContent = '✗ 上传失败：网络异常';
+          preview.classList.add('error');
+        });
+        xhr.addEventListener('timeout', () => {
+          const progressText = preview.querySelector('.progress-text');
+          progressText.textContent = '✗ 上传失败：请求超时';
+          preview.classList.add('error');
         });
         const formData = new FormData();
         formData.append('file', file);
