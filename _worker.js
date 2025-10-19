@@ -3546,7 +3546,7 @@ function generateUploadPage(categoryOptions, storageType) {
       }
       async function uploadFile(file) {
         if (maxSizeMB && file.size > maxSizeMB * 1024 * 1024) {
-          showConfirmModal(`文件超过${maxSizeMB}MB限制`, null, true);
+          showConfirmModal('文件超过' + maxSizeMB + 'MB限制', null, true);
           return;
         }
         if (enableCompression && enableCompression.checked && isCompressibleImage(file)) { try { file = await compressImage(file); } catch (err) { console.error('压缩失败，使用原文件:', err); } }
