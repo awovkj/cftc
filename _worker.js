@@ -4,6 +4,13 @@ async function initDatabase(config) {
     console.error("数据库配置缺失");
     throw new Error("数据库配置无效，请检查D1数据库是否正确绑定");
   }
+  if (config.database && config.database._isInMemory) {
+    console.log("检测到内存数据库，跳过表结构验证并进行轻量初始化...");
+    if (typeof config.database.init === 'function') {
+      await config.database.init();
+    }
+    return true;
+  }
   if (!config.fileCache) {
     config.fileCache = new Map();
     config.fileCacheTTL = 3600000;
@@ -392,15 +399,282 @@ async function setWebhook(webhookUrl, botToken) {
   console.error('多次尝试后仍未能设置webhook');
   return false;
 }
+function createInMemoryDatabase() {
+  const state = {
+    _isInMemory: true,
+    _initialized: false,
+    categories: [],
+    files: [],
+    user_settings: [],
+    _ids: { categories: 1, files: 1, user_settings: 1 }
+  };
+  function ensureInitialized() {
+    if (state._initialized) return;
+    // 默认分类
+    state.categories.push({ id: state._ids.categories++, name: '默认分类', created_at: Date.now() });
+    state._initialized = true;
+  }
+  function makeResult(resultsArray) {
+    return { results: Array.isArray(resultsArray) ? resultsArray : [] };
+  }
+  function prepare(sql) {
+    const normalized = sql.trim().replace(/\s+/g, ' ').toLowerCase();
+    let params = [];
+    const api = {
+      bind: (...p) => { params = p; return api; },
+      async run() {
+        ensureInitialized();
+        // 忽略与表结构相关的语句
+        if (normalized.startsWith('drop table') || normalized.startsWith('create table')) {
+          return { meta: { last_row_id: 0 } };
+        }
+        // categories 插入
+        if (normalized.startsWith('insert or ignore into categories (name) values (?)')) {
+          const [name] = params;
+          const exists = state.categories.find(c => c.name === name);
+          if (!exists) {
+            const id = state._ids.categories++;
+            state.categories.push({ id, name, created_at: Date.now() });
+            return { meta: { last_row_id: id } };
+          }
+          return { meta: { last_row_id: exists.id } };
+        }
+        if (normalized.startsWith('insert into categories (name, created_at) values')) {
+          const [name, created_at] = params;
+          const exists = state.categories.find(c => c.name === name);
+          if (exists) return { meta: { last_row_id: exists.id } };
+          const id = state._ids.categories++;
+          state.categories.push({ id, name, created_at: created_at || Date.now() });
+          return { meta: { last_row_id: id } };
+        }
+        // categories 删除
+        if (normalized.startsWith('delete from categories where id = ?')) {
+          const [id] = params;
+          const idx = state.categories.findIndex(c => c.id === Number(id));
+          if (idx >= 0) state.categories.splice(idx, 1);
+          return { meta: { last_row_id: 0 } };
+        }
+        // files 插入
+        if (normalized.startsWith('insert into files')) {
+          const columnsMatch = sql.match(/insert into files \(([^)]+)\)/i);
+          const cols = columnsMatch ? columnsMatch[1].split(',').map(s => s.trim()) : [];
+          const record = { id: state._ids.files++ };
+          cols.forEach((col, i) => {
+            const key = col.replace(/`/g, '');
+            record[key] = params[i];
+          });
+          state.files.push(record);
+          return { meta: { last_row_id: record.id } };
+        }
+        // files 更新分类
+        if (normalized.startsWith('update files set category_id = ? where category_id = ?')) {
+          const [newId, oldId] = params.map(Number);
+          state.files.forEach(f => { if (Number(f.category_id) === oldId) f.category_id = newId; });
+          return { meta: { last_row_id: 0 } };
+        }
+        if (normalized.startsWith('update files set category_id = null where category_id = ?')) {
+          const [oldId] = params.map(Number);
+          state.files.forEach(f => { if (Number(f.category_id) === oldId) f.category_id = null; });
+          return { meta: { last_row_id: 0 } };
+        }
+        // files 更新 URL
+        if (normalized.startsWith('update files set url = ? where id = ?')) {
+          const [url, id] = params;
+          const file = state.files.find(f => f.id === Number(id));
+          if (file) file.url = url;
+          return { meta: { last_row_id: 0 } };
+        }
+        // files 删除
+        if (normalized.startsWith('delete from files where id = ?')) {
+          const [id] = params;
+          const idx = state.files.findIndex(f => f.id === Number(id));
+          if (idx >= 0) state.files.splice(idx, 1);
+          return { meta: { last_row_id: 0 } };
+        }
+        // user_settings 插入
+        if (normalized.startsWith('insert into user_settings')) {
+          const columnsMatch = sql.match(/insert into user_settings \(([^)]+)\)/i);
+          const cols = columnsMatch ? columnsMatch[1].split(',').map(s => s.trim()) : [];
+          const record = { id: state._ids.user_settings++ };
+          cols.forEach((col, i) => {
+            const key = col.replace(/`/g, '');
+            record[key] = params[i];
+          });
+          state.user_settings.push(record);
+          return { meta: { last_row_id: record.id } };
+        }
+        // user_settings 更新
+        if (normalized.startsWith('update user_settings set storage_type = ?, current_category_id = ? where chat_id = ?')) {
+          const [storage_type, current_category_id, chat_id] = params;
+          const row = state.user_settings.find(u => u.chat_id == chat_id);
+          if (row) { row.storage_type = storage_type; row.current_category_id = current_category_id; }
+          return { meta: { last_row_id: 0 } };
+        }
+        if (normalized.startsWith('update user_settings set current_category_id = ? where current_category_id = ?')) {
+          const [newId, oldId] = params.map(Number);
+          state.user_settings.forEach(u => { if (Number(u.current_category_id) === oldId) u.current_category_id = newId; });
+          return { meta: { last_row_id: 0 } };
+        }
+        if (normalized.startsWith('update user_settings set waiting_for = null, editing_file_id = null where chat_id = ?')) {
+          const [chat_id] = params;
+          const row = state.user_settings.find(u => u.chat_id == chat_id);
+          if (row) { row.waiting_for = null; row.editing_file_id = null; }
+          return { meta: { last_row_id: 0 } };
+        }
+        if (normalized.startsWith('update user_settings set waiting_for = ?, editing_file_id = ? where chat_id = ?')) {
+          const [waiting_for, editing_file_id, chat_id] = params;
+          const row = state.user_settings.find(u => u.chat_id == chat_id);
+          if (row) { row.waiting_for = waiting_for; row.editing_file_id = editing_file_id; }
+          return { meta: { last_row_id: 0 } };
+        }
+        return { meta: { last_row_id: 0 } };
+      },
+      async all() {
+        ensureInitialized();
+        // categories 列表
+        if (normalized.startsWith('select id, name from categories')) {
+          return makeResult(state.categories.map(c => ({ id: c.id, name: c.name })));
+        }
+        if (normalized.startsWith('select * from files')) {
+          return makeResult(state.files.slice());
+        }
+        // files + categories 联表
+        if (normalized.startsWith('select f.url, f.fileid') && normalized.includes('from files f left join categories')) {
+          const results = state.files
+            .slice()
+            .sort((a,b) => new Date(b.created_at) - new Date(a.created_at))
+            .map(f => {
+              const cat = state.categories.find(c => c.id === Number(f.category_id));
+              return {
+                url: f.url,
+                fileId: f.fileId,
+                message_id: f.message_id,
+                created_at: f.created_at,
+                file_name: f.file_name,
+                file_size: f.file_size,
+                mime_type: f.mime_type,
+                storage_type: f.storage_type,
+                category_name: cat ? cat.name : null,
+                category_id: cat ? cat.id : null
+              };
+            });
+          return makeResult(results);
+        }
+        // 搜索 files
+        if (normalized.startsWith('select url, fileid, message_id, created_at, file_name, file_size, mime_type from files where file_name like')) {
+          const [pattern] = params;
+          const term = (pattern || '').replace(/%/g, '').toLowerCase();
+          const results = state.files
+            .filter(f => (f.file_name || '').toLowerCase().includes(term))
+            .sort((a,b) => new Date(b.created_at) - new Date(a.created_at))
+            .map(f => ({
+              url: f.url,
+              fileId: f.fileId,
+              message_id: f.message_id,
+              created_at: f.created_at,
+              file_name: f.file_name,
+              file_size: f.file_size,
+              mime_type: f.mime_type
+            }));
+          return makeResult(results);
+        }
+        // 通用返回空
+        return makeResult([]);
+      },
+      async first() {
+        ensureInitialized();
+        // categories by name
+        if (normalized.startsWith('select id from categories where name = ?')) {
+          const [name] = params;
+          const c = state.categories.find(c => c.name === name);
+          return c ? { id: c.id } : null;
+        }
+        if (normalized.startsWith('select id from categories where id = ? and name = ?')) {
+          const [id, name] = params.map((v,i) => (i===0?Number(v):v));
+          const c = state.categories.find(c => c.id === id && c.name === name);
+          return c ? { id: c.id } : null;
+        }
+        if (normalized.startsWith('select name from categories where id = ?')) {
+          const [id] = params.map(Number);
+          const c = state.categories.find(c => c.id === id);
+          return c ? { name: c.name } : null;
+        }
+        if (normalized.startsWith('select id from categories where name = ?')) {
+          const [name] = params;
+          const c = state.categories.find(c => c.name === name);
+          return c ? { id: c.id } : null;
+        }
+        if (normalized.startsWith('select * from user_settings where chat_id = ?')) {
+          const [chat_id] = params;
+          const u = state.user_settings.find(u => u.chat_id == chat_id);
+          return u || null;
+        }
+        if (normalized.startsWith('select id, url, file_name from files where url = ? and chat_id = ?')) {
+          const [url, chat_id] = params;
+          const f = state.files.find(f => f.url === url && f.chat_id == chat_id);
+          return f ? { id: f.id, url: f.url, file_name: f.file_name } : null;
+        }
+        if (normalized.startsWith('select id, url, file_name from files where (file_name = ? or url like ?) and chat_id = ?')) {
+          const [file_name, like, chat_id] = params;
+          const f = state.files.find(f => (f.file_name === file_name || (f.url || '').includes(file_name)) && f.chat_id == chat_id);
+          return f ? { id: f.id, url: f.url, file_name: f.file_name } : null;
+        }
+        if (normalized.startsWith('select * from files where id = ?')) {
+          const [id] = params.map(Number);
+          return state.files.find(f => f.id === id) || null;
+        }
+        if (normalized.startsWith('select * from files where url = ?')) {
+          const [url] = params;
+          return state.files.find(f => f.url === url) || null;
+        }
+        if (normalized.startsWith('select * from files where fileid = ? and id != ?')) {
+          const [fileId, notId] = params;
+          return state.files.find(f => f.fileId === fileId && f.id !== Number(notId)) || null;
+        }
+        if (normalized.startsWith('select * from files where url = ? and id != ?')) {
+          const [url, notId] = params;
+          return state.files.find(f => f.url === url && f.id !== Number(notId)) || null;
+        }
+        if (normalized.startsWith('select * from files where fileid = ?')) {
+          const [fileId] = params;
+          return state.files.find(f => f.fileId === fileId) || null;
+        }
+        if (normalized.startsWith('select * from files where file_name = ?')) {
+          const [file_name] = params;
+          return state.files.find(f => f.file_name === file_name) || null;
+        }
+        if (normalized.startsWith('select id, fileid, message_id, storage_type from files where url = ?')) {
+          const [url] = params;
+          const f = state.files.find(f => f.url === url);
+          return f ? { id: f.id, fileId: f.fileId, message_id: f.message_id, storage_type: f.storage_type } : null;
+        }
+        if (normalized.startsWith('select id, fileid, message_id, storage_type from files where fileid = ?')) {
+          const [fileId] = params;
+          const f = state.files.find(f => f.fileId === fileId);
+          return f ? { id: f.id, fileId: f.fileId, message_id: f.message_id, storage_type: f.storage_type } : null;
+        }
+        return null;
+      }
+    };
+    return api;
+  }
+  return {
+    prepare,
+    init() { ensureInitialized(); },
+    _isInMemory: true,
+    _state: state
+  };
+}
 export default {
   async fetch(request, env) {
-    if (!env.DATABASE) {
-      console.error("缺少DATABASE配置");
-      return new Response('缺少必要配置: DATABASE 环境变量未设置', { status: 500 });
+    let database = env.DATABASE;
+    if (!database) {
+      console.warn("未检测到DATABASE环境变量，启用内存数据库（适用于Vercel等无D1环境）");
+      database = createInMemoryDatabase();
     }
     const config = {
       domain: env.DOMAIN || request.headers.get("host") || '',
-      database: env.DATABASE,
+      database: database,
       username: env.USERNAME || '',
       password: env.PASSWORD || '',
       enableAuth: env.ENABLE_AUTH === 'true' || false,
@@ -1392,20 +1666,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     const fileResponse = await fetch(fileUrl);
     if (!fileResponse.ok) throw new Error(`获取文件内容失败: ${fileResponse.status} ${fileResponse.statusText}`);
     const contentLength = fileResponse.headers.get('content-length');
-    if (contentLength && parseInt(contentLength) > config.maxSizeMB * 1024 * 1024) {
-      if (processingMessageId) {
-        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: processingMessageId
-          })
-        }).catch(err => console.error('删除处理消息失败:', err));
-      }
-      await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
-      return;
-    }
+    
     fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1843,7 +2104,6 @@ async function handleUploadRequest(request, config) {
     const categoryId = formData.get('category');
     const storageType = formData.get('storage_type');
     if (!file) throw new Error('未找到文件');
-    if (file.size > config.maxSizeMB * 1024 * 1024) throw new Error(`文件超过${config.maxSizeMB}MB限制`);
     const chatId = config.tgChatId[0];
     let defaultCategory = await config.database.prepare('SELECT id FROM categories WHERE name = ?').bind('默认分类').first();
     if (!defaultCategory) {
@@ -2375,12 +2635,14 @@ function getContentType(ext) {
   return types[lowerExt] || 'application/octet-stream';
 }
 async function handleBingImagesRequest(request, config) {
-  const cache = caches.default;
+  const cache = (typeof caches !== 'undefined' && caches.default) ? caches.default : null;
   const cacheKey = new Request('https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=5');
-  const cachedResponse = await cache.match(cacheKey);
-  if (cachedResponse) {
-    console.log('Returning cached response');
-    return cachedResponse;
+  if (cache) {
+    const cachedResponse = await cache.match(cacheKey);
+    if (cachedResponse) {
+      console.log('Returning cached response');
+      return cachedResponse;
+    }
   }
   try {
     const res = await fetch(cacheKey);
@@ -2399,8 +2661,10 @@ async function handleBingImagesRequest(request, config) {
         'Access-Control-Allow-Origin': '*'
       }
     });
-    await cache.put(cacheKey, response.clone());
-    console.log('响应数据已缓存');
+    if (cache) {
+      await cache.put(cacheKey, response.clone());
+      console.log('响应数据已缓存');
+    }
     return response;
   } catch (error) {
     console.error('请求 Bing API 过程中发生错误:', error);
@@ -3043,6 +3307,25 @@ function generateUploadPage(categoryOptions, storageType) {
           <button class="storage-btn ${storageType === 'telegram' ? 'active' : ''}" data-storage="telegram">Telegram</button>
           <button class="storage-btn ${storageType === 'r2' ? 'active' : ''}" data-storage="r2">R2</button>
         </div>
+        <div class="compression-options" style="display:flex; gap:1rem; align-items:center; flex-wrap:wrap;">
+          <label style="display:flex; align-items:center; gap:6px;">
+            <input type="checkbox" id="enableCompression" checked>
+            启用图片压缩
+          </label>
+          <div class="compression-controls" id="compressionControls" style="display:flex; align-items:center; gap:10px;">
+            <label>质量
+              <input type="range" id="quality" min="0.1" max="1" step="0.05" value="0.8">
+              <span id="qualityVal">0.8</span>
+            </label>
+            <label>格式
+              <select id="outputFormat">
+                <option value="auto">自动</option>
+                <option value="image/webp">WEBP</option>
+                <option value="image/jpeg">JPEG</option>
+              </select>
+            </label>
+          </div>
+        </div>
       </div>
       <div class="upload-area" id="uploadArea">
         <p>点击选择 或 拖拽文件到此处</p>
@@ -3100,6 +3383,12 @@ function generateUploadPage(categoryOptions, storageType) {
       const confirmModalMessage = document.getElementById('confirmModalMessage');
       const confirmModalConfirm = document.getElementById('confirmModalConfirm');
       const confirmModalCancel = document.getElementById('confirmModalCancel');
+      const enableCompression = document.getElementById('enableCompression');
+      const qualityInput = document.getElementById('quality');
+      const qualityVal = document.getElementById('qualityVal');
+      const outputFormat = document.getElementById('outputFormat');
+      const compressionControls = document.getElementById('compressionControls');
+      qualityInput.addEventListener('input', () => { qualityVal.textContent = qualityInput.value; });
       let uploadedUrls = [];
       let currentConfirmCallback = null;
       storageButtons.forEach(btn => {
@@ -3202,21 +3491,54 @@ function generateUploadPage(categoryOptions, storageType) {
         }
       });
       async function handleFiles(e) {
-        const response = await fetch('/config');
-        if (!response.ok) {
-          throw new Error('Failed to fetch config');
-        }
-        const config = await response.json();
+        
+        
         const files = Array.from(e.target.files);
         for (let file of files) {
-          if (file.size > config.maxSizeMB * 1024 * 1024) {
+          if (false && file.size > config.maxSizeMB * 1024 * 1024) {
             showConfirmModal(\`文件超过\${config.maxSizeMB}MB限制\`, null, true);
             return;
           }
           await uploadFile(file);
         }
       }
+      function isCompressibleImage(file) {
+        const t = (file && file.type || '').toLowerCase();
+        return t.startsWith('image/') && !t.includes('gif') && !t.includes('svg');
+      }
+      async function compressImage(file) {
+        const mime = (outputFormat && outputFormat.value && outputFormat.value !== 'auto') ? outputFormat.value : 'image/webp';
+        const quality = parseFloat(qualityInput && qualityInput.value ? qualityInput.value : '0.8');
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const img = new Image();
+            img.onload = () => {
+              try {
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth;
+                canvas.height = img.naturalHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                canvas.toBlob((blob) => {
+                  if (!blob) { resolve(file); return; }
+                  const ext = mime === 'image/jpeg' ? 'jpg' : 'webp';
+                  const base = file.name.replace(/\.[^.]+$/, '');
+                  const newName = base + '.' + ext;
+                  const compressedFile = new File([blob], newName, { type: mime });
+                  resolve(compressedFile);
+                }, mime, quality);
+              } catch (err) { reject(err); }
+            };
+            img.onerror = reject;
+            img.src = reader.result;
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      }
       async function uploadFile(file) {
+        if (enableCompression && enableCompression.checked && isCompressibleImage(file)) { try { file = await compressImage(file); } catch (err) { console.error('压缩失败，使用原文件:', err); } }
         const preview = createPreview(file);
         previewArea.appendChild(preview);
         const xhr = new XMLHttpRequest();
@@ -3238,6 +3560,9 @@ function generateUploadPage(categoryOptions, storageType) {
               uploadedUrls.push(data.url);
               updateUrlArea();
               preview.classList.add('success');
+              if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(data.url).catch(() => {});
+              }
             } else {
               const errorMsg = [data.msg, data.error || '未知错误'].filter(Boolean).join(' | ');
               progressText.textContent = errorMsg;
