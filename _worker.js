@@ -3713,7 +3713,7 @@ function generateUploadPage(categoryOptions, storageType) {
         });
         const activeStorageBtn = document.querySelector('.storage-btn.active');
         const storage = activeStorageBtn ? activeStorageBtn.dataset.storage : 'telegram';
-        if (storage === 'r2' || storage === 'telegram') {
+        if (storage === 'r2') {
           const params = new URLSearchParams();
           params.set('filename', file.name || 'upload.bin');
           params.set('category', categorySelect.value || '');
