@@ -3787,8 +3787,8 @@ function generateUploadPage(categoryOptions, storageType) {
               xhr.upload.addEventListener('progress', (e) => {
                 if (e.lengthComputable) {
                   const percent = Math.round(((uploadedBytes + e.loaded) / file.size) * 100);
-                  progressTrack.style.width = `${percent}%`;
-                  progressText.textContent = `${percent}%`;
+                  progressTrack.style.width = \`\${percent}%\`;
+                  progressText.textContent = \`\${percent}%\`;
                 }
               });
               xhr.addEventListener('load', () => {
@@ -3807,7 +3807,7 @@ function generateUploadPage(categoryOptions, storageType) {
               });
               xhr.addEventListener('error', () => reject(new Error('网络错误')));
               const fd = new FormData();
-              fd.append('file', blob, `${file.name}.part${i}`);
+              fd.append('file', blob, \`\${file.name}.part\${i}\`);
               fd.append('uploadId', uploadId);
               fd.append('chunkIndex', i);
               xhr.open('POST', '/chunk/part');
@@ -3830,7 +3830,7 @@ function generateUploadPage(categoryOptions, storageType) {
           uploadedUrls.push(completeData.url);
           updateUrlArea();
         } catch (error) {
-          progressText.textContent = `✘ 上传失败 | ${error.message}`;
+          progressText.textContent = \`✘ 上传失败 | \${error.message}\`;
           preview.classList.add('error');
         }
       }
