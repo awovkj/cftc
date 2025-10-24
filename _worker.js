@@ -2492,7 +2492,7 @@ async function handleAdminRequest(request, config) {
       ? categories.results.map(c => `<option value="${c.id}">${c.name}</option>`).join('')
       : '<option value="">暂无分类</option>';
     const files = await config.database.prepare(`
-      SELECT f.url, f.fileId, f.message_id, f.created_at, f.file_name, f.file_size, f.mime_type, f.storage_type, c.name as category_name, c.id as category_id
+      SELECT f.id, f.url, f.fileId, f.message_id, f.created_at, f.file_name, f.file_size, f.mime_type, f.storage_type, c.name as category_name, c.id as category_id
       FROM files f
       LEFT JOIN categories c ON f.category_id = c.id
       ORDER BY f.created_at DESC
@@ -2620,6 +2620,21 @@ async function handleFileRequest(request, config) {
     if (!path) {
       return new Response('Not Found', { status: 404 });
     }
+    
+    // Parse Range header
+    const rangeHeader = request.headers.get('Range');
+    let rangeStart = 0;
+    let rangeEnd = null;
+    let isRangeRequest = false;
+    
+    if (rangeHeader) {
+      const rangeMatch = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+      if (rangeMatch) {
+        isRangeRequest = true;
+        rangeStart = parseInt(rangeMatch[1]);
+        rangeEnd = rangeMatch[2] ? parseInt(rangeMatch[2]) : null;
+      }
+    }
     const cacheKey = `file:${path}`;
     if (config.fileCache && config.fileCache.has(cacheKey)) {
       const cachedData = config.fileCache.get(cacheKey);
@@ -2643,6 +2658,7 @@ async function handleFileRequest(request, config) {
       const headers = new Headers();
       headers.set('Content-Type', contentType);
       headers.set('Access-Control-Allow-Origin', '*');
+      headers.set('Accept-Ranges', 'bytes');
       if (contentType.startsWith('image/') || 
           contentType.startsWith('video/') || 
           contentType.startsWith('audio/')) {
@@ -2727,6 +2743,75 @@ async function handleFileRequest(request, config) {
         if (!chunks.length) {
           return new Response('Chunk info missing', { status: 500 });
         }
+        
+        const totalSize = file.file_size || chunks.reduce((sum, c) => sum + (c.size || 0), 0);
+        const contentType = file.mime_type || getContentType(path.split('.').pop());
+        
+        // Handle Range requests for video playback
+        if (isRangeRequest) {
+          const start = rangeStart;
+          const end = rangeEnd !== null ? rangeEnd : totalSize - 1;
+          const chunkSize = end - start + 1;
+          
+          const headers = getCommonHeaders(contentType);
+          headers.set('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+          headers.set('Content-Length', chunkSize.toString());
+          
+          const stream = new ReadableStream({
+            async start(controller) {
+              try {
+                let currentPosition = 0;
+                for (const c of chunks) {
+                  const chunkStart = currentPosition;
+                  const chunkEnd = currentPosition + (c.size || 0) - 1;
+                  
+                  // Skip chunks before range start
+                  if (chunkEnd < start) {
+                    currentPosition += c.size || 0;
+                    continue;
+                  }
+                  
+                  // Stop if we've passed range end
+                  if (chunkStart > end) {
+                    break;
+                  }
+                  
+                  const getResp = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${c.fileId}`);
+                  const getData = await getResp.json();
+                  if (!getResp.ok || !getData.ok) {
+                    throw new Error('获取分片失败');
+                  }
+                  const partUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${getData.result.file_path}`;
+                  const partResp = await fetch(partUrl);
+                  if (!partResp.ok) {
+                    throw new Error('分片下载失败: ' + partResp.status);
+                  }
+                  
+                  const chunkData = await partResp.arrayBuffer();
+                  const chunkBytes = new Uint8Array(chunkData);
+                  
+                  // Calculate which bytes of this chunk to send
+                  const sliceStart = Math.max(0, start - chunkStart);
+                  const sliceEnd = Math.min(chunkBytes.length, end - chunkStart + 1);
+                  
+                  if (sliceStart < sliceEnd) {
+                    controller.enqueue(chunkBytes.slice(sliceStart, sliceEnd));
+                  }
+                  
+                  currentPosition += c.size || 0;
+                }
+                controller.close();
+              } catch (err) {
+                console.error('Telegram分片Range请求失败:', err.message);
+                controller.error(err);
+              }
+            }
+          });
+          
+          return new Response(stream, { status: 206, headers });
+        }
+        
+        // Full file request (no range)
         const stream = new ReadableStream({
           async start(controller) {
             try {
@@ -2755,8 +2840,8 @@ async function handleFileRequest(request, config) {
             }
           }
         });
-        const contentType = file.mime_type || getContentType(path.split('.').pop());
         const headers = getCommonHeaders(contentType);
+        headers.set('Content-Length', totalSize.toString());
         return cacheAndReturnResponse(new Response(stream, { headers }));
       } catch (error) {
         console.error('处理Telegram分片文件出错:', error.message);
@@ -2785,6 +2870,69 @@ async function handleFileRequest(request, config) {
         if (!chunks.length) {
           return new Response('Chunk info missing', { status: 500 });
         }
+        
+        const totalSize = file.file_size || chunks.reduce((sum, c) => sum + (c.size || 0), 0);
+        const contentType = file.mime_type || getContentType(path.split('.').pop());
+        
+        // Handle Range requests for video playback
+        if (isRangeRequest) {
+          const start = rangeStart;
+          const end = rangeEnd !== null ? rangeEnd : totalSize - 1;
+          const chunkSize = end - start + 1;
+          
+          const headers = getCommonHeaders(contentType);
+          headers.set('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+          headers.set('Content-Length', chunkSize.toString());
+          
+          const stream = new ReadableStream({
+            async start(controller) {
+              try {
+                let currentPosition = 0;
+                for (const c of chunks) {
+                  const chunkStart = currentPosition;
+                  const chunkEnd = currentPosition + (c.size || 0) - 1;
+                  
+                  // Skip chunks before range start
+                  if (chunkEnd < start) {
+                    currentPosition += c.size || 0;
+                    continue;
+                  }
+                  
+                  // Stop if we've passed range end
+                  if (chunkStart > end) {
+                    break;
+                  }
+                  
+                  const object = await config.bucket.get(c.fileId);
+                  if (!object || !object.body) {
+                    throw new Error(`R2分片缺失: ${c.fileId}`);
+                  }
+                  
+                  const chunkData = await object.arrayBuffer();
+                  const chunkBytes = new Uint8Array(chunkData);
+                  
+                  // Calculate which bytes of this chunk to send
+                  const sliceStart = Math.max(0, start - chunkStart);
+                  const sliceEnd = Math.min(chunkBytes.length, end - chunkStart + 1);
+                  
+                  if (sliceStart < sliceEnd) {
+                    controller.enqueue(chunkBytes.slice(sliceStart, sliceEnd));
+                  }
+                  
+                  currentPosition += c.size || 0;
+                }
+                controller.close();
+              } catch (err) {
+                console.error('R2分片Range请求失败:', err.message);
+                controller.error(err);
+              }
+            }
+          });
+          
+          return new Response(stream, { status: 206, headers });
+        }
+        
+        // Full file request (no range)
         const stream = new ReadableStream({
           async start(controller) {
             try {
@@ -2807,8 +2955,8 @@ async function handleFileRequest(request, config) {
             }
           }
         });
-        const contentType = file.mime_type || getContentType(path.split('.').pop());
         const headers = getCommonHeaders(contentType);
+        headers.set('Content-Length', totalSize.toString());
         return cacheAndReturnResponse(new Response(stream, { headers }));
       } catch (error) {
         console.error('处理R2分片文件出错:', error.message);
