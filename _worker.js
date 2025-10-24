@@ -2415,6 +2415,16 @@ async function handleChunkComplete(request, config) {
     const finalUrl = `https://${config.domain}/${Date.now()}.${ext}`;
     const totalSize = list.reduce((sum, c) => sum + (c.size || 0), 0);
     const fileIdPayload = JSON.stringify({ type: session.storage_type === 'r2' ? 'r2_chunk' : 'telegram_chunk', uploadId, chunks: list.map(c => ({ index: c.chunk_index, fileId: c.file_id, messageId: c.message_id, size: c.size })) });
+    console.log('[Chunk Complete] 准备插入文件记录:', {
+      finalUrl,
+      fileName: session.original_file_name,
+      fileSize: totalSize,
+      storageType: (session.storage_type === 'r2' ? 'r2_chunk' : 'telegram_chunk'),
+      categoryId: session.category_id,
+      chatId: session.chat_id,
+      chunksCount: list.length
+    });
+    
     await config.database.prepare(`
       INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id, chat_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2430,6 +2440,8 @@ async function handleChunkComplete(request, config) {
       session.category_id,
       session.chat_id
     ).run();
+    
+    console.log('[Chunk Complete] 文件记录插入成功:', finalUrl);
     await config.database.prepare('UPDATE upload_sessions SET status = ?, completed_at = ?, final_url = ? WHERE upload_id = ?').bind('completed', Date.now(), finalUrl, uploadId).run();
     return new Response(JSON.stringify({ status: 1, url: finalUrl, uploadId }), { headers: { 'Content-Type': 'application/json' } });
   } catch (error) {
@@ -2487,6 +2499,30 @@ async function handleAdminRequest(request, config) {
     `).all();
     const fileList = files.results || [];
     console.log(`文件总数: ${fileList.length}`);
+    
+    // 调试信息：显示所有文件的详细信息
+    fileList.forEach((file, index) => {
+      console.log(`文件 ${index + 1}:`, {
+        url: file.url,
+        fileName: file.file_name,
+        fileSize: file.file_size,
+        storageType: file.storage_type,
+        createdAt: file.created_at,
+        categoryName: file.category_name
+      });
+    });
+    
+    // 特别检查切片文件
+    const chunkFiles = fileList.filter(f => f.storage_type === 'telegram_chunk' || f.storage_type === 'r2_chunk');
+    console.log(`切片文件数量: ${chunkFiles.length}`);
+    chunkFiles.forEach((file, index) => {
+      console.log(`切片文件 ${index + 1}:`, {
+        url: file.url,
+        fileName: file.file_name,
+        fileSize: file.file_size,
+        storageType: file.storage_type
+      });
+    });
     const fileCards = fileList.map(file => {
         const url = file.url;
         const uniqueId = `file-checkbox-${encodeURIComponent(url)}`;
@@ -2633,17 +2669,29 @@ async function handleFileRequest(request, config) {
     }
     let file;
     const urlPattern = `https://${config.domain}/${path}`;
+    console.log(`[File Request] 查找文件: ${path}, URL模式: ${urlPattern}`);
+    
     file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
     if (!file) {
+      console.log(`[File Request] 通过URL未找到，尝试通过fileId查找: ${path}`);
       file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
     }
     if (!file) {
       const fileName = path.split('/').pop();
+      console.log(`[File Request] 通过fileId未找到，尝试通过文件名查找: ${fileName}`);
       file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
     }
     if (!file) {
+      console.log(`[File Request] 文件未找到: ${path}`);
       return new Response('File not found', { status: 404 });
     }
+    
+    console.log(`[File Request] 找到文件记录:`, {
+      url: file.url,
+      fileName: file.file_name,
+      storageType: file.storage_type,
+      fileSize: file.file_size
+    });
     if (file.storage_type === 'telegram') {
       try {
         const telegramFileId = file.fileId;
