@@ -1470,6 +1470,31 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
   const processingMessageId = processingMessage && processingMessage.result ? processingMessage.result.message_id : null;
   try {
     console.log('原始文件信息:', JSON.stringify(file));
+    
+    // 检查文件大小，如果超过20MB则无法通过Bot API下载
+    const fileSize = file.file_size || 0;
+    const BOT_API_LIMIT = 20 * 1024 * 1024; // 20MB - Telegram Bot API limit
+    
+    if (fileSize > BOT_API_LIMIT) {
+      console.log(`[Bot Upload] 文件大小 ${fileSize} 超过Bot API限制 ${BOT_API_LIMIT}`);
+      if (processingMessageId) {
+        await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: processingMessageId
+          })
+        }).catch(err => console.error('删除处理消息失败:', err));
+      }
+      await sendMessage(
+        chatId, 
+        `❌ 文件大小为 ${formatSize(fileSize)}，超过了Telegram Bot API的20MB限制。\n\n建议：\n1. 压缩文件后重试\n2. 切换到R2存储（需要配置）\n3. 分割文件后分别上传`, 
+        config.tgBotToken
+      );
+      return;
+    }
+    
     const filePathPromise = fetch(`https://api.telegram.org/bot${config.tgBotToken}/getFile?file_id=${file.file_id}`)
       .then(response => response.json());
     let categoryId = null;
@@ -1497,7 +1522,18 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
         });
     }
     const data = await filePathPromise;
-    if (!data.ok) throw new Error(`获取文件路径失败: ${JSON.stringify(data)}`);
+    if (!data.ok) {
+      // 更详细的错误处理
+      const errorDesc = data.description || '未知错误';
+      console.error('获取文件路径失败:', JSON.stringify(data));
+      
+      // 检查是否是文件过大错误
+      if (errorDesc.includes('file is too big') || errorDesc.includes('too big')) {
+        throw new Error(`文件过大，无法通过Bot API下载。建议使用R2存储或压缩文件后重试。`);
+      }
+      
+      throw new Error(`获取文件路径失败: ${errorDesc}`);
+    }
     console.log('获取到文件路径:', data.result.file_path);
     const fileUrl = `https://api.telegram.org/file/bot${config.tgBotToken}/${data.result.file_path}`;
     const fileResponse = await fetch(fileUrl);
@@ -2572,10 +2608,11 @@ async function handleAdminRequest(request, config) {
               <div>分类: ${file.category_name || '无分类'}</div>
               ${file.storage_type === 'telegram_chunk' || file.storage_type === 'r2_chunk' ? '<div style="color: #6c757d; font-size: 0.8em;">切片文件</div>' : ''}
             </div>
-            <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px;">
-              <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
-              <button class="btn btn-delete" style="flex:1;" onclick="showConfirmModal('确定要删除这个文件吗？', function() { deleteFile('${url}'); })">删除</button>
-              <button class="btn btn-edit" style="flex:1;" onclick="showEditSuffixModal('${url}')">修改后缀</button>
+            <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px; flex-wrap:wrap;">
+              <button class="btn btn-open" style="flex:1; background-color:#2ecc71; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold; min-width:60px;" onclick="window.open('${url}', '_blank')">打开</button>
+              <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold; min-width:60px;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
+              <button class="btn btn-delete" style="flex:1; min-width:60px;" onclick="showConfirmModal('确定要删除这个文件吗？', function() { deleteFile('${url}'); })">删除</button>
+              <button class="btn btn-edit" style="flex:1; min-width:60px;" onclick="showEditSuffixModal('${url}')">修改后缀</button>
             </div>
           </div>
         `;
@@ -4431,6 +4468,11 @@ function generateAdminPage(fileCards, categoryOptions) {
         display: inline-block;
         text-align: center;
       }
+      .btn-open {
+        background: #2ecc71;
+        color: white;
+        flex: 1;
+      }
       .btn-share {
         background: #3498db;
         color: white;
@@ -4455,6 +4497,9 @@ function generateAdminPage(fileCards, categoryOptions) {
       .btn:hover {
         transform: translateY(-2px);
         box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      }
+      .btn-open:hover {
+        background: #27ae60;
       }
       .btn-share:hover {
         background: #2980b9;
@@ -5183,9 +5228,13 @@ function generateAdminPage(fileCards, categoryOptions) {
             const card = document.querySelector('.file-card[data-url="' + currentEditUrl + '"]');
             if (card) {
               card.setAttribute('data-url', data.newUrl);
+              const openBtn = card.querySelector('.btn-open');
               const shareBtn = card.querySelector('.btn-share');
               const deleteBtn = card.querySelector('.btn-delete');
               const editBtn = card.querySelector('.btn-edit');
+              if (openBtn) {
+                openBtn.setAttribute('onclick', 'window.open("' + data.newUrl + '", "_blank")');
+              }
               if (shareBtn) {
                 const fileName = getFileName(data.newUrl);
                 shareBtn.setAttribute('onclick', 'shareFile("' + data.newUrl + '", "' + fileName + '")');
