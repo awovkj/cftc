@@ -3706,6 +3706,15 @@ function generateUploadPage(categoryOptions, storageType) {
       async function uploadFile(file) {
         const preview = createPreview(file);
         previewArea.appendChild(preview);
+
+        const activeStorageBtn = document.querySelector('.storage-btn.active');
+        const activeStorage = activeStorageBtn ? activeStorageBtn.dataset.storage : 'telegram';
+        const directLimitBytes = 47 * 1024 * 1024;
+
+        if (activeStorage === 'telegram' && file.size > directLimitBytes) {
+          await uploadFileChunkedTelegram(file, preview);
+          return;
+        }
         const xhr = new XMLHttpRequest();
         const progressTrack = preview.querySelector('.progress-track');
         const progressText = preview.querySelector('.progress-text');
@@ -3741,6 +3750,89 @@ function generateUploadPage(categoryOptions, storageType) {
         formData.append('storage_type', document.querySelector('.storage-btn.active').dataset.storage);
         xhr.open('POST', '/upload');
         xhr.send(formData);
+      }
+      async function uploadFileChunkedTelegram(file, preview) {
+        const progressTrack = preview.querySelector('.progress-track');
+        const progressText = preview.querySelector('.progress-text');
+
+        const CHUNK_SIZE = 15 * 1024 * 1024;
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+        try {
+          const initRes = await fetch('/chunk/init', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              originalFileName: file.name,
+              originalFileType: file.type || 'application/octet-stream',
+              totalChunks,
+              storageType: 'telegram',
+              categoryId: categorySelect.value
+            })
+          });
+          const initData = await initRes.json();
+          if (!initRes.ok || initData.status !== 1 || !initData.uploadId) {
+            throw new Error(initData.msg || '初始化失败');
+          }
+          const uploadId = initData.uploadId;
+          let uploadedBytes = 0;
+
+          for (let i = 0; i < totalChunks; i++) {
+            const start = i * CHUNK_SIZE;
+            const end = Math.min(file.size, start + CHUNK_SIZE);
+            const blob = file.slice(start, end);
+
+            await new Promise((resolve, reject) => {
+              const xhr = new XMLHttpRequest();
+              xhr.upload.addEventListener('progress', (e) => {
+                if (e.lengthComputable) {
+                  const percent = Math.round(((uploadedBytes + e.loaded) / file.size) * 100);
+                  progressTrack.style.width = `${percent}%`;
+                  progressText.textContent = `${percent}%`;
+                }
+              });
+              xhr.addEventListener('load', () => {
+                try {
+                  const data = JSON.parse(xhr.responseText);
+                  if (xhr.status >= 200 && xhr.status < 300 && data.status === 1) {
+                    uploadedBytes += blob.size;
+                    resolve();
+                  } else {
+                    const errorMsg = [data.msg, data.error || '未知错误'].filter(Boolean).join(' | ');
+                    reject(new Error(errorMsg));
+                  }
+                } catch (e) {
+                  reject(new Error('响应解析失败'));
+                }
+              });
+              xhr.addEventListener('error', () => reject(new Error('网络错误')));
+              const fd = new FormData();
+              fd.append('file', blob, `${file.name}.part${i}`);
+              fd.append('uploadId', uploadId);
+              fd.append('chunkIndex', i);
+              xhr.open('POST', '/chunk/part');
+              xhr.send(fd);
+            });
+          }
+
+          const completeRes = await fetch('/chunk/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ uploadId })
+          });
+          const completeData = await completeRes.json();
+          if (!completeRes.ok || completeData.status !== 1 || !completeData.url) {
+            throw new Error(completeData.msg || '合并完成失败');
+          }
+
+          progressText.textContent = completeData.msg || '✔ 分片上传成功';
+          preview.classList.add('success');
+          uploadedUrls.push(completeData.url);
+          updateUrlArea();
+        } catch (error) {
+          progressText.textContent = `✘ 上传失败 | ${error.message}`;
+          preview.classList.add('error');
+        }
       }
       function createPreview(file) {
         const div = document.createElement('div');
