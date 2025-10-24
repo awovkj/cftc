@@ -254,127 +254,6 @@ async function validateDatabaseStructure(config) {
     return false;
   }
 }
-async function recreateCategoriesTable(config) {
-  try {
-    const existingData = await config.database.prepare('SELECT * FROM categories').all();
-    await config.database.prepare('DROP TABLE IF EXISTS categories').run();
-    await config.database.prepare(`
-      CREATE TABLE categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL UNIQUE,
-        created_at INTEGER NOT NULL
-      )
-    `).run();
-    if (existingData && existingData.results && existingData.results.length > 0) {
-      for (const row of existingData.results) {
-        await config.database.prepare('INSERT OR IGNORE INTO categories (id, name, created_at) VALUES (?, ?, ?)')
-          .bind(row.id || null, row.name || '未命名分类', row.created_at || Date.now()).run();
-      }
-      console.log(`已恢复 ${existingData.results.length} 个分类数据`);
-    }
-    console.log("分类表重建完成");
-  } catch (error) {
-    console.error(`重建分类表失败: ${error.message}`);
-  }
-}
-async function recreateUserSettingsTable(config) {
-  try {
-    await config.database.prepare('DROP TABLE IF EXISTS user_settings').run();
-    await config.database.prepare(`
-      CREATE TABLE user_settings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id TEXT NOT NULL UNIQUE,
-        storage_type TEXT DEFAULT 'r2',
-        category_id INTEGER,
-        custom_suffix TEXT,
-        waiting_for TEXT,
-        editing_file_id TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      )
-    `).run();
-    console.log('用户设置表重新创建成功');
-    return true;
-  } catch (error) {
-    console.error('重新创建用户设置表失败:', error);
-    return false;
-  }
-}
-async function recreateFilesTable(config) {
-  console.log('开始重建文件表...');
-  try {
-    console.log('备份现有数据...');
-    const existingData = await config.database.prepare('SELECT * FROM files').all();
-    console.log('删除现有表...');
-    await config.database.prepare('DROP TABLE IF EXISTS files').run();
-    console.log('创建新表...');
-    await config.database.prepare(`
-      CREATE TABLE files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT NOT NULL,
-        fileId TEXT NOT NULL,
-        message_id INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        file_name TEXT,
-        file_size INTEGER,
-        mime_type TEXT,
-        chat_id TEXT,
-        storage_type TEXT NOT NULL DEFAULT 'telegram',
-        category_id INTEGER,
-        custom_suffix TEXT,
-        FOREIGN KEY (category_id) REFERENCES categories(id)
-      )
-    `).run();
-    console.log('恢复数据...');
-    if (existingData && existingData.results && existingData.results.length > 0) {
-      console.log(`恢复 ${existingData.results.length} 条记录...`);
-      for (const row of existingData.results) {
-        const timestamp = row.created_at || Math.floor(Date.now() / 1000);
-        const messageId = row.message_id || 0;
-        try {
-          await config.database.prepare(`
-            INSERT INTO files (
-              url, fileId, message_id, created_at, file_name, file_size, 
-              mime_type, chat_id, storage_type, category_id, custom_suffix
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).bind(
-            row.url, 
-            row.fileId || row.url, 
-            messageId,
-            timestamp,
-            row.file_name, 
-            row.file_size, 
-            row.mime_type, 
-            row.chat_id, 
-            row.storage_type || 'telegram', 
-            row.category_id,
-            row.custom_suffix
-          ).run();
-        } catch (e) {
-          console.error(`恢复记录失败: ${e.message}`, row);
-        }
-      }
-    }
-    console.log('文件表重建完成!');
-    return true;
-  } catch (error) {
-    console.error('重建文件表失败:', error);
-    return false;
-  }
-}
-async function checkAndAddMissingColumns(config) {
-  try {
-    await ensureColumnExists(config, 'files', 'custom_suffix', 'TEXT');
-    await ensureColumnExists(config, 'files', 'chat_id', 'TEXT');
-    await ensureColumnExists(config, 'user_settings', 'custom_suffix', 'TEXT');
-    await ensureColumnExists(config, 'user_settings', 'waiting_for', 'TEXT');
-    await ensureColumnExists(config, 'user_settings', 'editing_file_id', 'TEXT');
-    await ensureColumnExists(config, 'user_settings', 'current_category_id', 'INTEGER');
-    return true;
-  } catch (error) {
-    console.error('检查并添加缺失列失败:', error);
-    return false;
-  }
-}
 async function ensureColumnExists(config, tableName, columnName, columnType) {
   console.log(`确保列 ${columnName} 存在于表 ${tableName} 中...`); 
   try {
@@ -1026,7 +905,6 @@ async function sendPanel(chatId, userSetting, config) {
     if (config.menuCache && config.menuCache.has(cacheKey)) {
       const cachedData = config.menuCache.get(cacheKey);
       if (Date.now() - cachedData.timestamp < config.menuCacheTTL) {
-        console.log(`使用缓存的菜单: ${cacheKey}`);
         const response = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1034,7 +912,6 @@ async function sendPanel(chatId, userSetting, config) {
         });
         if (!response.ok) {
           config.menuCache.delete(cacheKey);
-          console.log(`缓存菜单发送失败，重新生成: ${await response.text()}`);
         } else {
           return await response.json();
         }
@@ -1086,11 +963,9 @@ async function generateMainMenu(chatId, userSetting, config) {
     const now = Date.now();
     if (!config.notificationCache || (now - config.lastNotificationFetch > config.notificationCacheTTL)) {
       try {
-        console.log('[Notification] Fetching new notification...');
         config.notificationCache = await fetchNotification();
         config.lastNotificationFetch = now;
       } catch (error) {
-        console.error('[Notification] Failed to fetch notification:', error);
         config.notificationCache = config.notificationCache || ''; 
       }
     }
@@ -1167,7 +1042,6 @@ async function handleCallbackQuery(update, config, userSetting) {
     if (config.buttonCache && config.buttonCache.has(cacheKey) && !cbData.startsWith('delete_file_confirm_') && !cbData.startsWith('delete_file_do_') ) {
       const cachedData = config.buttonCache.get(cacheKey);
       if (Date.now() - cachedData.timestamp < config.buttonCacheTTL) {
-        console.log(`使用缓存的按钮响应: ${cacheKey}`);
         await answerPromise;
         if (cachedData.responseText) {
           await sendMessage(chatId, cachedData.responseText, config.tgBotToken);
@@ -1945,7 +1819,7 @@ async function handleUploadRequest(request, config) {
     if (storageType === 'telegram') {
       const directLimitBytes = 47 * 1024 * 1024; // 直接发送上限，超出则分片
       if (file.size > directLimitBytes) {
-        const chunkSize = 15 * 1024 * 1024; // 每片约15MB
+        const chunkSize = 45 * 1024 * 1024; // 每片约45MB
         const totalChunks = Math.ceil(file.size / chunkSize);
         const uploadId = `up_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const sessionChatId = chatId;
@@ -2498,31 +2372,6 @@ async function handleAdminRequest(request, config) {
       ORDER BY f.created_at DESC
     `).all();
     const fileList = files.results || [];
-    console.log(`文件总数: ${fileList.length}`);
-    
-    // 调试信息：显示所有文件的详细信息
-    fileList.forEach((file, index) => {
-      console.log(`文件 ${index + 1}:`, {
-        url: file.url,
-        fileName: file.file_name,
-        fileSize: file.file_size,
-        storageType: file.storage_type,
-        createdAt: file.created_at,
-        categoryName: file.category_name
-      });
-    });
-    
-    // 特别检查切片文件
-    const chunkFiles = fileList.filter(f => f.storage_type === 'telegram_chunk' || f.storage_type === 'r2_chunk');
-    console.log(`切片文件数量: ${chunkFiles.length}`);
-    chunkFiles.forEach((file, index) => {
-      console.log(`切片文件 ${index + 1}:`, {
-        url: file.url,
-        fileName: file.file_name,
-        fileSize: file.file_size,
-        storageType: file.storage_type
-      });
-    });
     const fileCards = fileList.map(file => {
         const url = file.url;
         const uniqueId = `file-checkbox-${encodeURIComponent(url)}`;
@@ -2606,7 +2455,7 @@ function getPreviewHtml(url, fileInfo = null) {
   if (isImage) {
     return `<img src="${url}" alt="预览" style="max-width: 100%; max-height: 100%; object-fit: contain;">`;
   } else if (isVideo) {
-    return `<video src="${url}" controls style="max-width: 100%; max-height: 100%; object-fit: contain;"></video>`;
+    return `<video src="${url}" preload="metadata" style="max-width: 100%; max-height: 100%; object-fit: contain;"></video>`;
   } else if (isAudio) {
     return `<audio src="${url}" controls style="width: 100%;"></audio>`;
   } else {
@@ -2639,7 +2488,6 @@ async function handleFileRequest(request, config) {
     if (config.fileCache && config.fileCache.has(cacheKey)) {
       const cachedData = config.fileCache.get(cacheKey);
       if (Date.now() - cachedData.timestamp < config.fileCacheTTL) {
-        console.log(`从缓存提供文件: ${path}`);
         return cachedData.response.clone();
       } else {
         config.fileCache.delete(cacheKey);
@@ -2685,29 +2533,18 @@ async function handleFileRequest(request, config) {
     }
     let file;
     const urlPattern = `https://${config.domain}/${path}`;
-    console.log(`[File Request] 查找文件: ${path}, URL模式: ${urlPattern}`);
     
     file = await config.database.prepare('SELECT * FROM files WHERE url = ?').bind(urlPattern).first();
     if (!file) {
-      console.log(`[File Request] 通过URL未找到，尝试通过fileId查找: ${path}`);
       file = await config.database.prepare('SELECT * FROM files WHERE fileId = ?').bind(path).first();
     }
     if (!file) {
       const fileName = path.split('/').pop();
-      console.log(`[File Request] 通过fileId未找到，尝试通过文件名查找: ${fileName}`);
       file = await config.database.prepare('SELECT * FROM files WHERE file_name = ?').bind(fileName).first();
     }
     if (!file) {
-      console.log(`[File Request] 文件未找到: ${path}`);
       return new Response('File not found', { status: 404 });
     }
-    
-    console.log(`[File Request] 找到文件记录:`, {
-      url: file.url,
-      fileName: file.file_name,
-      storageType: file.storage_type,
-      fileSize: file.file_size
-    });
     if (file.storage_type === 'telegram') {
       try {
         const telegramFileId = file.fileId;
@@ -4055,7 +3892,7 @@ function generateUploadPage(categoryOptions, storageType) {
         const progressTrack = preview.querySelector('.progress-track');
         const progressText = preview.querySelector('.progress-text');
 
-        const CHUNK_SIZE = 15 * 1024 * 1024;
+        const CHUNK_SIZE = 45 * 1024 * 1024;
         const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
         try {
