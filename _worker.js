@@ -2160,12 +2160,50 @@ async function handleDeleteMultipleRequest(request, config) {
             } catch (error) {
               console.error(`从Telegram删除消息失败: ${error.message}`);
             }
+          } else if (file.storage_type === 'telegram_chunk' && file.fileId) {
+            try {
+              // 删除切片文件的所有分片
+              let payload;
+              try { payload = JSON.parse(file.fileId); } catch (e) {}
+              if (payload && Array.isArray(payload.chunks)) {
+                for (const chunk of payload.chunks) {
+                  if (chunk.messageId && chunk.messageId > 0) {
+                    try {
+                      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${chunk.messageId}`);
+                      console.log(`已删除切片消息: ${chunk.messageId}`);
+                    } catch (error) {
+                      console.error(`删除切片消息失败: ${error.message}`);
+                    }
+                  }
+                }
+              }
+            } catch (error) {
+              console.error(`删除Telegram切片文件失败: ${error.message}`);
+            }
           } else if (file.storage_type === 'r2' && file.fileId && config.bucket) {
             try {
               await config.bucket.delete(file.fileId);
               console.log(`已从R2删除文件: ${file.fileId}`);
             } catch (error) {
               console.error(`从R2删除文件失败: ${error.message}`);
+            }
+          } else if (file.storage_type === 'r2_chunk' && file.fileId && config.bucket) {
+            try {
+              // 删除R2切片文件的所有分片
+              let payload;
+              try { payload = JSON.parse(file.fileId); } catch (e) {}
+              if (payload && Array.isArray(payload.chunks)) {
+                for (const chunk of payload.chunks) {
+                  try {
+                    await config.bucket.delete(chunk.fileId);
+                    console.log(`已删除R2切片: ${chunk.fileId}`);
+                  } catch (error) {
+                    console.error(`删除R2切片失败: ${error.message}`);
+                  }
+                }
+              }
+            } catch (error) {
+              console.error(`删除R2切片文件失败: ${error.message}`);
             }
           }
           await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
@@ -2456,13 +2494,14 @@ async function handleAdminRequest(request, config) {
           <div class="file-card" data-url="${url}" data-category-id="${file.category_id || ''}">
             <input type="checkbox" id="${uniqueId}" name="selectedFile" class="file-checkbox" value="${url}">
             <div class="file-preview">
-              ${getPreviewHtml(url)}
+              ${getPreviewHtml(url, file)}
             </div>
             <div class="file-info">
               <div>${getFileName(url)}</div>
               <div>大小: ${formatSize(file.file_size || 0)}</div>
               <div>上传时间: ${formatDate(file.created_at)}</div>
               <div>分类: ${file.category_name || '无分类'}</div>
+              ${file.storage_type === 'telegram_chunk' || file.storage_type === 'r2_chunk' ? '<div style="color: #6c757d; font-size: 0.8em;">切片文件</div>' : ''}
             </div>
             <div class="file-actions" style="display:flex; gap:5px; justify-content:space-between; padding:10px;">
               <button class="btn btn-share" style="flex:1; background-color:#3498db; color:white; padding:8px 12px; border-radius:6px; border:none; cursor:pointer; font-weight:bold;" onclick="shareFile('${url}', '${getFileName(url)}')">分享</button>
@@ -2489,7 +2528,7 @@ async function handleSearchRequest(request, config) {
     const { query } = await request.json();
     const searchPattern = `%${query}%`;
     const files = await config.database.prepare(`
-      SELECT url, fileId, message_id, created_at, file_name, file_size, mime_type
+      SELECT url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type
        FROM files 
        WHERE file_name LIKE ? ESCAPE '!'
        COLLATE NOCASE
@@ -2507,19 +2546,35 @@ async function handleSearchRequest(request, config) {
     );
   }
 }
-function getPreviewHtml(url) {
+function getPreviewHtml(url, fileInfo = null) {
   const ext = (url.split('.').pop() || '').toLowerCase();
   const isImage = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'icon'].includes(ext);
   const isVideo = ['mp4', 'webm'].includes(ext);
   const isAudio = ['mp3', 'wav', 'ogg'].includes(ext);
+  
+  // 检查是否为切片上传的文件
+  if (fileInfo && (fileInfo.storage_type === 'telegram_chunk' || fileInfo.storage_type === 'r2_chunk')) {
+    // 对于切片文件，显示特殊标识和文件信息
+    const chunkIcon = fileInfo.storage_type === 'telegram_chunk' ? '📱' : '☁️';
+    return `
+      <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; background: #f8f9fa; border: 2px dashed #dee2e6; border-radius: 8px;">
+        <div style="font-size: 48px; margin-bottom: 8px;">${chunkIcon}</div>
+        <div style="font-size: 12px; color: #6c757d; text-align: center; padding: 0 8px;">
+          <div>切片文件</div>
+          <div style="margin-top: 4px;">${formatSize(fileInfo.file_size || 0)}</div>
+        </div>
+      </div>
+    `;
+  }
+  
   if (isImage) {
-    return `<img src="${url}" alt="预览">`;
+    return `<img src="${url}" alt="预览" style="max-width: 100%; max-height: 100%; object-fit: contain;">`;
   } else if (isVideo) {
-    return `<video src="${url}" controls></video>`;
+    return `<video src="${url}" controls style="max-width: 100%; max-height: 100%; object-fit: contain;"></video>`;
   } else if (isAudio) {
-    return `<audio src="${url}" controls></audio>`;
+    return `<audio src="${url}" controls style="width: 100%;"></audio>`;
   } else {
-    return `<div style="font-size: 48px">📄</div>`;
+    return `<div style="font-size: 48px; display: flex; align-items: center; justify-content: center; height: 100%;">📄</div>`;
   }
 }
 async function handleFileRequest(request, config) {
@@ -2757,9 +2812,58 @@ async function handleDeleteRequest(request, config) {
       url: file.url,
       存储类型: file.storage_type
     });
-    if (file.storage_type === 'r2' && config.bucket) {
+    
+    // 根据存储类型删除文件
+    if (file.storage_type === 'telegram' && file.message_id) {
+      try {
+        await fetch(
+          `https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${file.message_id}`
+        );
+        console.log('已从Telegram删除消息:', file.message_id);
+      } catch (error) {
+        console.error('从Telegram删除消息失败:', error.message);
+      }
+    } else if (file.storage_type === 'telegram_chunk' && file.fileId) {
+      try {
+        // 删除切片文件的所有分片
+        let payload;
+        try { payload = JSON.parse(file.fileId); } catch (e) {}
+        if (payload && Array.isArray(payload.chunks)) {
+          for (const chunk of payload.chunks) {
+            if (chunk.messageId && chunk.messageId > 0) {
+              try {
+                await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage?chat_id=${config.tgStorageChatId}&message_id=${chunk.messageId}`);
+                console.log('已删除切片消息:', chunk.messageId);
+              } catch (error) {
+                console.error('删除切片消息失败:', error.message);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error('删除Telegram切片文件失败:', error.message);
+      }
+    } else if (file.storage_type === 'r2' && config.bucket) {
       await deleteFile(file.fileId, config);
       console.log('已从R2存储中删除文件:', file.fileId);
+    } else if (file.storage_type === 'r2_chunk' && file.fileId && config.bucket) {
+      try {
+        // 删除R2切片文件的所有分片
+        let payload;
+        try { payload = JSON.parse(file.fileId); } catch (e) {}
+        if (payload && Array.isArray(payload.chunks)) {
+          for (const chunk of payload.chunks) {
+            try {
+              await config.bucket.delete(chunk.fileId);
+              console.log('已删除R2切片:', chunk.fileId);
+            } catch (error) {
+              console.error('删除R2切片失败:', error.message);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('删除R2切片文件失败:', error.message);
+      }
     }
     await config.database.prepare('DELETE FROM files WHERE id = ?').bind(file.id).run();
     console.log('已从数据库中删除文件记录');
