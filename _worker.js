@@ -1293,6 +1293,178 @@ async function handleCallbackQuery(update, config, userSetting) {
     await sendMessage(chatId, `❌ 处理请求时出错: ${error.message}`, config.tgBotToken);
   }
 }
+async function handleTelegramChunkedUpload(chatId, fileResponse, fileName, mimeType, fileSize, categoryId, config, processingMessageId) {
+  try {
+    const CHUNK_SIZE = 45 * 1024 * 1024;
+    const totalChunks = Math.ceil(fileSize / CHUNK_SIZE);
+    
+    const uploadId = `up_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    
+    await config.database.prepare(`
+      INSERT INTO upload_sessions (upload_id, original_file_name, original_file_type, total_chunks, storage_type, status, chat_id, category_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      uploadId,
+      fileName,
+      mimeType,
+      totalChunks,
+      'telegram',
+      'initialized',
+      chatId,
+      categoryId,
+      Date.now()
+    ).run();
+    
+    console.log(`[Bot Chunk Upload] 初始化会话: ${uploadId}, 分片数: ${totalChunks}`);
+    
+    const fileArrayBuffer = await fileResponse.arrayBuffer();
+    const fileBuffer = new Uint8Array(fileArrayBuffer);
+    
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(fileSize, start + CHUNK_SIZE);
+      const chunk = fileBuffer.slice(start, end);
+      
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: processingMessageId,
+          text: `⏳ 正在上传分片 ${i + 1}/${totalChunks} (${Math.round((i / totalChunks) * 100)}%)...`
+        })
+      }).catch(err => console.error('更新处理消息失败:', err));
+      
+      const tgFormData = new FormData();
+      tgFormData.append('chat_id', config.tgStorageChatId);
+      const blob = new Blob([chunk], { type: mimeType });
+      tgFormData.append('document', blob, `${uploadId}.${String(i).padStart(5, '0')}.part`);
+      tgFormData.append('caption', `分片 ${i + 1}/${totalChunks} • ${fileName} • ${uploadId}`);
+      
+      const tgResponse = await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendDocument`, { 
+        method: 'POST', 
+        body: tgFormData 
+      });
+      
+      if (!tgResponse.ok) {
+        const errText = await tgResponse.text();
+        throw new Error(`发送分片 ${i} 到Telegram失败: ${errText}`);
+      }
+      
+      const tgData = await tgResponse.json();
+      const storedMessageId = tgData.result?.message_id || null;
+      const storedFileId = tgData.result?.document?.file_id || null;
+      
+      if (!storedFileId || !storedMessageId) {
+        throw new Error(`未获取到分片 ${i} 的file_id或消息ID`);
+      }
+      
+      await config.database.prepare(`
+        INSERT INTO file_chunks (upload_id, chunk_index, file_id, message_id, size, mime_type, storage_type, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        uploadId,
+        i,
+        storedFileId,
+        storedMessageId,
+        chunk.length,
+        mimeType,
+        'telegram',
+        'completed'
+      ).run();
+      
+      console.log(`[Bot Chunk Upload] 分片 ${i + 1}/${totalChunks} 上传成功`);
+    }
+    
+    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: processingMessageId,
+        text: "⏳ 正在合并分片..."
+      })
+    }).catch(err => console.error('更新处理消息失败:', err));
+    
+    const chunks = await config.database.prepare(
+      'SELECT chunk_index, file_id, message_id, size FROM file_chunks WHERE upload_id = ? ORDER BY chunk_index ASC'
+    ).bind(uploadId).all();
+    const chunkList = chunks.results || [];
+    
+    const ext = (fileName || '').split('.').pop() || 'bin';
+    const finalUrl = `https://${config.domain}/${Date.now()}.${ext}`;
+    const totalSize = chunkList.reduce((sum, c) => sum + (c.size || 0), 0);
+    const fileIdPayload = JSON.stringify({ 
+      type: 'telegram_chunk', 
+      uploadId, 
+      chunks: chunkList.map(c => ({ 
+        index: c.chunk_index, 
+        fileId: c.file_id, 
+        messageId: c.message_id, 
+        size: c.size 
+      })) 
+    });
+    
+    await config.database.prepare(`
+      INSERT INTO files (url, fileId, message_id, created_at, file_name, file_size, mime_type, storage_type, category_id, chat_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      finalUrl,
+      fileIdPayload,
+      -1,
+      Date.now(),
+      fileName,
+      totalSize,
+      mimeType,
+      'telegram_chunk',
+      categoryId,
+      chatId
+    ).run();
+    
+    await config.database.prepare(
+      'UPDATE upload_sessions SET status = ?, completed_at = ?, final_url = ? WHERE upload_id = ?'
+    ).bind('completed', Date.now(), finalUrl, uploadId).run();
+    
+    console.log(`[Bot Chunk Upload] 上传完成: ${finalUrl}`);
+    
+    if (processingMessageId) {
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: processingMessageId
+        })
+      }).catch(err => console.error('删除处理消息失败:', err));
+    }
+    
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(finalUrl)}`;
+    await fetch(`https://api.telegram.org/bot${config.tgBotToken}/sendPhoto`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        photo: qrCodeUrl,
+        caption: `✅ 文件上传成功（分片上传）\n\n📝 图床直链：\n${finalUrl}\n\n🔍 扫描上方二维码快速访问`,
+        parse_mode: 'HTML'
+      })
+    });
+    
+  } catch (error) {
+    console.error("[Bot Chunk Upload Error]", error);
+    if (processingMessageId) {
+      await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: processingMessageId
+        })
+      }).catch(err => console.error('删除处理消息失败:', err));
+    }
+    await sendMessage(chatId, `❌ 分片上传失败: ${error.message}`, config.tgBotToken);
+  }
+}
 async function handleMediaUpload(chatId, file, isDocument, config, userSetting) {
   const processingMessage = await sendMessage(chatId, "⏳ 正在处理您的文件，请稍候...", config.tgBotToken);
   const processingMessageId = processingMessage && processingMessage.result ? processingMessage.result.message_id : null;
@@ -1345,21 +1517,14 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       await sendMessage(chatId, `❌ 文件超过${config.maxSizeMB}MB限制`, config.tgBotToken);
       return;
     }
-    fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: processingMessageId,
-        text: "⏳ 文件已接收，正在上传到存储..."
-      })
-    }).catch(err => console.error('更新处理消息失败:', err));
+    
     if (categoryPromise) {
       const defaultCategory = await categoryPromise;
       if (defaultCategory) {
         categoryId = defaultCategory.id;
       }
     }
+    
     let fileName = '';
     let ext = '';
     let mimeType = file.mime_type || 'application/octet-stream';
@@ -1390,6 +1555,26 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     if (!mimeType || mimeType === 'application/octet-stream') {
       mimeType = getContentType(ext);
     }
+    
+    const fileSize = parseInt(contentLength || '0');
+    const CHUNK_THRESHOLD = 45 * 1024 * 1024;
+    const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
+    
+    if (storageType === 'telegram' && fileSize > CHUNK_THRESHOLD) {
+      console.log(`[Bot Chunk Upload] 文件大小 ${fileSize} 超过阈值 ${CHUNK_THRESHOLD}，使用分段上传`);
+      await handleTelegramChunkedUpload(chatId, fileResponse, fileName, mimeType, fileSize, categoryId, config, processingMessageId);
+      return;
+    }
+    
+    fetch(`https://api.telegram.org/bot${config.tgBotToken}/editMessageText`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: processingMessageId,
+        text: "⏳ 文件已接收，正在上传到存储..."
+      })
+    }).catch(err => console.error('更新处理消息失败:', err));
     const mimeParts = mimeType.split('/');
     const mainType = mimeParts[0] || '';
     const subType = mimeParts[1] || '';
@@ -1402,7 +1587,6 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       size: contentLength,
       filePath: data.result.file_path
     }));
-    const storageType = userSetting && userSetting.storage_type ? userSetting.storage_type : 'r2';
     let finalUrl, dbFileId, dbMessageId;
     const timestamp = Date.now();
     const originalFileName = fileName.replace(/[^a-zA-Z0-9\-\_\.]/g, '_'); 
