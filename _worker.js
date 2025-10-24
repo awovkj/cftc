@@ -1472,11 +1472,11 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
     console.log('原始文件信息:', JSON.stringify(file));
     
     // 检查文件大小，如果超过20MB则无法通过Bot API下载
-    const fileSize = file.file_size || 0;
+    const initialFileSize = file.file_size || 0;
     const BOT_API_LIMIT = 20 * 1024 * 1024; // 20MB - Telegram Bot API limit
     
-    if (fileSize > BOT_API_LIMIT) {
-      console.log(`[Bot Upload] 文件大小 ${fileSize} 超过Bot API限制 ${BOT_API_LIMIT}`);
+    if (initialFileSize > BOT_API_LIMIT) {
+      console.log(`[Bot Upload] 文件大小 ${initialFileSize} 超过Bot API限制 ${BOT_API_LIMIT}`);
       if (processingMessageId) {
         await fetch(`https://api.telegram.org/bot${config.tgBotToken}/deleteMessage`, {
           method: 'POST',
@@ -1489,7 +1489,7 @@ async function handleMediaUpload(chatId, file, isDocument, config, userSetting) 
       }
       await sendMessage(
         chatId, 
-        `❌ 文件大小为 ${formatSize(fileSize)}，超过了Telegram Bot API的20MB限制。\n\n建议：\n1. 压缩文件后重试\n2. 切换到R2存储（需要配置）\n3. 分割文件后分别上传`, 
+        `❌ 文件大小为 ${formatSize(initialFileSize)}，超过了Telegram Bot API的20MB限制。\n\n建议：\n1. 压缩文件后重试\n2. 切换到R2存储（需要配置）\n3. 分割文件后分别上传`, 
         config.tgBotToken
       );
       return;
